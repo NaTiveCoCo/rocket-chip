@@ -217,6 +217,7 @@ class L2TLBEntry(nSets: Int)(implicit p: Parameters) extends CoreBundle()(p)
   * @todo details in two-stage translation
   */
 class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(p) {
+  require(!coreParams.hasNACC || !usingHypervisor, "NACC does not support hypervisor translation")
   val io = IO(new Bundle {
     /** to n TLB */
     val requestor = Flipped(Vec(n, new TLBPTWIO))
@@ -329,6 +330,14 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     //use vpn slice as offset
     raw_pte_addr.apply(size.min(raw_pte_addr.getWidth) - 1, 0)
   }
+  def inNACCAgentRegion(addr: UInt): Bool = if (coreParams.hasNACC) {
+    val physicalAddress = addr.padTo(xLen)
+    physicalAddress >= io.dpath.customCSRs.naccSagentValue &&
+      physicalAddress < io.dpath.customCSRs.naccEagentValue
+  } else {
+    false.B
+  }
+  val naccPTEAccessFault = inNACCAgentRegion(pte_addr)
   /** stage2_pte_cache input addr */
   val stage2_pte_cache_addr = if (!usingHypervisor) 0.U else {
     val vpn_idxs = (0 until pgLevels - 1).map { i =>
@@ -364,9 +373,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       else Cat(r_req.vstage1, pte_addr.padTo(if (usingHypervisor) vaddrBits else paddrBits))
 
     val hits = tags.map(_ === tag).asUInt & valid
-    val hit = hits.orR && can_hit
+    val hit = hits.orR && can_hit && !naccPTEAccessFault
     // refill with mem response
-    when (mem_resp_valid && traverse && can_refill && !hits.orR && !invalidated) {
+    when (mem_resp_valid && traverse && can_refill && !hits.orR && !invalidated && !naccPTEAccessFault) {
       val r = Mux(valid.andR, plru.way, PriorityEncoder(~valid))
       valid := valid | UIntToOH(r)
       tags(r) := tag
@@ -512,7 +521,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   // mem request
   io.mem.keep_clock_enabled := false.B
 
-  io.mem.req.valid := state === s_req || state === s_dummy1
+  io.mem.req.valid := (state === s_req || state === s_dummy1) && !naccPTEAccessFault
   io.mem.req.bits.phys := true.B
   io.mem.req.bits.cmd  := M_XRD
   io.mem.req.bits.size := log2Ceil(xLen/8).U
@@ -546,7 +555,19 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   }
   val pmaHomogeneous = pmaPgLevelHomogeneous(count)
   val pmpHomogeneous = new PMPHomogeneityChecker(io.dpath.pmp).apply(r_pte.ppn << pgIdxBits, count)
-  val homogeneous = pmaHomogeneous && pmpHomogeneous
+  val naccPgLevelHomogeneous = (0 until pgLevels).map { i =>
+    val addressWidth = xLen + 1
+    val pageSize = BigInt(1) << (pgIdxBits + ((pgLevels - 1 - i) * pgLevelBits))
+    val pageStart = (r_pte.ppn << pgIdxBits).padTo(addressWidth)
+    val pageEnd = pageStart + pageSize.U(addressWidth.W)
+    val regionStart = io.dpath.customCSRs.naccSagentValue.padTo(addressWidth)
+    val regionEnd = io.dpath.customCSRs.naccEagentValue.padTo(addressWidth)
+    val outsideRegion = pageEnd <= regionStart || pageStart >= regionEnd
+    val insideRegion = pageStart >= regionStart && pageEnd <= regionEnd
+    outsideRegion || insideRegion
+  }
+  val naccHomogeneous = if (coreParams.hasNACC) naccPgLevelHomogeneous(count) else true.B
+  val homogeneous = pmaHomogeneous && pmpHomogeneous && naccHomogeneous
   // response to tlb
   for (i <- 0 until io.requestor.size) {
     io.requestor(i).resp.valid := resp_valid(i)
@@ -626,7 +647,11 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
         gpa_pgoff := Mux(aux_count === (pgLevels-1).U, r_req.addr << (xLen/8).log2, stage2_pte_cache_addr)
       }
       // pte_cache hit
-      when (stage2_pte_cache_hit) {
+      when (naccPTEAccessFault) {
+        resp_ae_ptw := true.B
+        next_state := s_ready
+        resp_valid(r_req_dest) := true.B
+      }.elsewhen (stage2_pte_cache_hit) {
         aux_count := aux_count + 1.U
         aux_pte.ppn := stage2_pte_cache_data
         aux_pte.reserved_for_future := 0.U

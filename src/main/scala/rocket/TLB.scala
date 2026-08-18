@@ -144,6 +144,7 @@ class TLBEntryData(implicit p: Parameters) extends CoreBundle()(p) {
   val eff = Bool()
   /** cacheable */
   val c = Bool()
+  val inNACCAgentRegion = coreParams.hasNACC.option(Bool())
   /** fragmented_superpage support */
   val fragmented_superpage = Bool()
 }
@@ -317,6 +318,7 @@ case class TLBConfig(
   */
 class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(p) {
   override def desiredName = if (instruction) "ITLB" else "DTLB"
+  require(!coreParams.hasNACC || !usingHypervisor, "NACC does not support hypervisor translation")
   val io = IO(new Bundle {
     /** request from Core */
     val req = Flipped(Decoupled(new TLBReq(lgMaxSize)))
@@ -412,6 +414,15 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val mpu_ppn = Mux(do_refill, refill_ppn,
                 Mux(vm_enabled && special_entry.nonEmpty.B, special_entry.map(e => e.ppn(vpn, e.getData(vpn))).getOrElse(0.U), io.req.bits.vaddr >> pgIdxBits))
   val mpu_physaddr = Cat(mpu_ppn, io.req.bits.vaddr(pgIdxBits-1, 0))
+  def inNACCAgentRegion(addr: UInt): Bool = if (coreParams.hasNACC) {
+    val physicalAddress = addr.padTo(xLen)
+    physicalAddress >= io.ptw.customCSRs.naccSagentValue &&
+      physicalAddress < io.ptw.customCSRs.naccEagentValue
+  } else {
+    false.B
+  }
+  val naccAgentMode = if (coreParams.hasNACC) io.ptw.customCSRs.naccStateValue(49, 48) === 1.U else false.B
+  val naccPrivilegeAllowed = priv === PRV.M.U || (priv === PRV.S.U && naccAgentMode)
   val mpu_priv = Mux[UInt](usingVM.B && (do_refill || io.req.bits.passthrough /* PTW */), PRV.S.U, Cat(io.ptw.status.debug, priv))
   val pmp = Module(new PMPChecker(lgMaxSize))
   pmp.io.addr := mpu_physaddr
@@ -469,6 +480,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     newEntry.pal := prot_al
     newEntry.paa := prot_aa
     newEntry.eff := prot_eff
+    newEntry.inNACCAgentRegion.foreach(_ := inNACCAgentRegion(refill_ppn << pgIdxBits))
     newEntry.fragmented_superpage := io.ptw.resp.bits.fragmented_superpage
     // refill special_entry
     when (special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) {
@@ -524,13 +536,20 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val hr_array = Cat(true.B, entries.map(_.hr).asUInt | Mux(io.ptw.status.mxr, entries.map(_.hx).asUInt, 0.U) | stage2_bypass)
   val hw_array = Cat(true.B, entries.map(_.hw).asUInt | stage2_bypass)
   val hx_array = Cat(true.B, entries.map(_.hx).asUInt | stage2_bypass)
+  val nacc_access_array = if (coreParams.hasNACC) {
+    val physicalAccessAllowed = !inNACCAgentRegion(mpu_physaddr) || naccPrivilegeAllowed
+    val entryAccessAllowed = normal_entries.map(e => !e.inNACCAgentRegion.get || naccPrivilegeAllowed)
+    Cat(Fill(nPhysicalEntries, physicalAccessAllowed), entryAccessAllowed.asUInt)
+  } else {
+    Fill(nPhysicalEntries + normal_entries.size, true.B)
+  }
   // These array is for each TLB entries.
   // user mode can read: PMA OK, TLB OK, AE OK
-  val pr_array = Cat(Fill(nPhysicalEntries, prot_r), normal_entries.map(_.pr).asUInt) & ~(ptw_ae_array | final_ae_array)
+  val pr_array = Cat(Fill(nPhysicalEntries, prot_r), normal_entries.map(_.pr).asUInt) & ~(ptw_ae_array | final_ae_array) & nacc_access_array
   // user mode can write: PMA OK, TLB OK, AE OK
-  val pw_array = Cat(Fill(nPhysicalEntries, prot_w), normal_entries.map(_.pw).asUInt) & ~(ptw_ae_array | final_ae_array)
+  val pw_array = Cat(Fill(nPhysicalEntries, prot_w), normal_entries.map(_.pw).asUInt) & ~(ptw_ae_array | final_ae_array) & nacc_access_array
   // user mode can write: PMA OK, TLB OK, AE OK
-  val px_array = Cat(Fill(nPhysicalEntries, prot_x), normal_entries.map(_.px).asUInt) & ~(ptw_ae_array | final_ae_array)
+  val px_array = Cat(Fill(nPhysicalEntries, prot_x), normal_entries.map(_.px).asUInt) & ~(ptw_ae_array | final_ae_array) & nacc_access_array
   // put effect
   val eff_array = Cat(Fill(nPhysicalEntries, prot_eff), normal_entries.map(_.eff).asUInt)
   // cacheable
