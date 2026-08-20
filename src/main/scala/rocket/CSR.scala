@@ -806,6 +806,24 @@ class CSRFile(
   val reg_custom = customCSRs.zip(io.customCSRs).map(t => generateCustomCSR(t._1, t._2))
   val reg_rocc = roccCSRs.zip(io.roccCSRs).map(t => generateCustomCSR(t._1, t._2))
 
+  // Reuse storage generated above from BoomCustomCSRs declarations; do not create another CSR or Reg.
+  def existingCustomCSRValue(id: Int): UInt = {
+    val matches = customCSRs.zipWithIndex.filter(_._1.id == id)
+    require(matches.size == 1, f"NACC requires exactly one custom CSR at 0x$id%03x")
+    reg_custom(matches.head._2)
+  }
+
+  val naccState = if (coreParams.hasNACC) {
+    existingCustomCSRValue(0x3f0)
+  } else {
+    0.U(xLen.W)
+  }
+  val naccTwinEntry = if (coreParams.hasNACC) {
+    existingCustomCSRValue(0x5c0)
+  } else {
+    0.U(xLen.W)
+  }
+
   if (usingHypervisor) {
     read_mapping += CSRs.mtinst -> read_mtinst
     read_mapping += CSRs.mtval2 -> reg_mtval2
@@ -994,7 +1012,6 @@ class CSRFile(
   val nmiTVec = (Mux(causeIsNmi, nmiTVecInt, nmiTVecXcpt)>>1)<<1
 
   val tvec = Mux(trapToDebug, debugTVec, Mux(trapToNmi, nmiTVec, notDebugTVec))
-  io.evec := tvec
   io.ptbr := reg_satp
   io.hgatp := reg_hgatp
   io.vsatp := reg_vsatp
@@ -1033,6 +1050,30 @@ class CSRFile(
 
   val epc = formEPC(io.pc)
   val tval = Mux(insn_break, epc, io.tval)
+
+  // Match the trap-state update priority below and select only traps that actually enter S-mode.
+  val trapToSupervisor = exception && !trapToDebug && !trapToNmiInt &&
+    !delegateVS && delegate && nmie
+  val naccAgentMode = if (coreParams.hasNACC) {
+    naccState(49, 48) === 1.U
+  } else {
+    false.B
+  }
+  val naccProtectedTrap = trapToSupervisor && naccAgentMode &&
+    reg_mstatus.prv.isOneOf(PRV.U.U, PRV.S.U)
+  val naccTwinTarget = if (coreParams.hasNACC) {
+    encodeVirtualAddress(naccTwinEntry, naccTwinEntry)
+  } else {
+    0.U(vaddrBitsExtended.W)
+  }
+
+  when (naccProtectedTrap) {
+    // Do not fall back to stvec: keep selecting twin_entry and fail-stop on invalid configuration.
+    assert(naccTwinEntry.orR, "NACC protected trap redirect has zero twin_entry")
+  }
+
+  // twin_entry is the direct protected-trap target; do not apply the stvec vector offset.
+  io.evec := Mux(naccProtectedTrap, naccTwinTarget, tvec)
 
   when (exception) {
     when (trapToDebug) {
@@ -1666,6 +1707,13 @@ class CSRFile(
   def formEPC(x: UInt) = ~(~x | (if (usingCompressed) 1.U else 3.U))
   def readEPC(x: UInt) = ~(~x | Mux(reg_misa('c' - 'a'), 1.U, 3.U))
   def formTVec(x: UInt) = x andNot Mux(x(0), ((((BigInt(1) << mtvecInterruptAlign) - 1) << mtvecBaseAlign) | 2).U, 2.U)
+  def encodeVirtualAddress(a0: UInt, ea: UInt) = if (vaddrBitsExtended == vaddrBits) ea else {
+    // Compress an XLEN virtual address while preserving the non-canonical marker.
+    val b = vaddrBitsExtended - 1
+    val a = (a0 >> b).asSInt
+    val msb = Mux(a === 0.S || a === -1.S, ea(b), !ea(b - 1))
+    Cat(msb, ea(b - 1, 0))
+  }
   def isaStringToMask(s: String) = s.map(x => 1 << (x - 'A')).foldLeft(0)(_|_)
   def formFS(fs: UInt) = if (coreParams.haveFSDirty) fs else Fill(2, fs.orR)
   def formVS(vs: UInt) = if (usingVector) vs else 0.U
