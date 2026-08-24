@@ -263,6 +263,7 @@ class CSRFileIO(hasBeu: Boolean)(implicit p: Parameters) extends CoreBundle
   val rw = new Bundle {
     val addr = Input(UInt(CSR.ADDRSZ.W))
     val cmd = Input(Bits(CSR.SZ.W))
+    val inst = coreParams.hasNACC.option(Input(UInt(iLen.W)))
     val rdata = Output(Bits(xLen.W))
     val wdata = Input(Bits(xLen.W))
   }
@@ -823,6 +824,33 @@ class CSRFile(
   } else {
     0.U(xLen.W)
   }
+  val naccTrampoline = if (coreParams.hasNACC) {
+    existingCustomCSRValue(0x5c1)
+  } else {
+    0.U(xLen.W)
+  }
+
+  if (coreParams.hasNACC) {
+    require(xLen > NACCState.PendingReturnBit, "NACC requires an XLEN wide enough for nacc_state")
+  }
+  val naccAcallLegal = if (coreParams.hasNACC) {
+    reg_mstatus.prv === PRV.S.U &&
+      naccState(NACCState.StateHigh, NACCState.StateLow) === NACCState.Agent.U &&
+      naccState(NACCState.CidBits - 1, 0).orR &&
+      !naccState(NACCState.PendingReturnBit) &&
+      naccTrampoline.orR
+  } else {
+    false.B
+  }
+  val naccAretActive = if (coreParams.hasNACC) {
+    reg_mstatus.prv === PRV.S.U &&
+      naccState(NACCState.StateHigh, NACCState.StateLow) === NACCState.Linux.U &&
+      naccState(NACCState.CidBits - 1, 0).orR &&
+      naccState(NACCState.PendingReturnBit) &&
+      naccTrampoline.orR
+  } else {
+    false.B
+  }
 
   if (usingHypervisor) {
     read_mapping += CSRs.mtinst -> read_mtinst
@@ -894,23 +922,26 @@ class CSRFile(
 
   val system_insn = io.rw.cmd === CSR.I
   val hlsv = Seq(HLV_B, HLV_BU, HLV_H, HLV_HU, HLV_W, HLV_WU, HLV_D, HSV_B, HSV_H, HSV_W, HSV_D, HLVX_HU, HLVX_WU)
-  val decode_table = Seq(        ECALL->       List(Y,N,N,N,N,N,N,N,N),
-                                 EBREAK->      List(N,Y,N,N,N,N,N,N,N),
-                                 MRET->        List(N,N,Y,N,N,N,N,N,N),
-                                 CEASE->       List(N,N,N,Y,N,N,N,N,N),
-                                 WFI->         List(N,N,N,N,Y,N,N,N,N)) ++
-    usingDebug.option(           DRET->        List(N,N,Y,N,N,N,N,N,N)) ++
-    usingNMI.option(             MNRET->       List(N,N,Y,N,N,N,N,N,N)) ++
-    coreParams.haveCFlush.option(CFLUSH_D_L1-> List(N,N,N,N,N,N,N,N,N)) ++
-    usingSupervisor.option(      SRET->        List(N,N,Y,N,N,N,N,N,N)) ++
-    usingVM.option(              SFENCE_VMA->  List(N,N,N,N,N,Y,N,N,N)) ++
-    usingHypervisor.option(      HFENCE_VVMA-> List(N,N,N,N,N,N,Y,N,N)) ++
-    usingHypervisor.option(      HFENCE_GVMA-> List(N,N,N,N,N,N,N,Y,N)) ++
-    (if (usingHypervisor)        hlsv.map(_->  List(N,N,N,N,N,N,N,N,Y)) else Seq())
-  val insn_call :: insn_break :: insn_ret :: insn_cease :: insn_wfi :: _ :: _ :: _ :: _ :: Nil = {
-    val insn = ECALL.value.U | (io.rw.addr << 20)
+  val decode_table = Seq(        ECALL->       List(Y,N,N,N,N,N,N,N,N,N,N),
+                                 EBREAK->      List(N,Y,N,N,N,N,N,N,N,N,N),
+                                 MRET->        List(N,N,Y,N,N,N,N,N,N,N,N),
+                                 CEASE->       List(N,N,N,Y,N,N,N,N,N,N,N),
+                                 WFI->         List(N,N,N,N,Y,N,N,N,N,N,N)) ++
+    usingDebug.option(           DRET->        List(N,N,Y,N,N,N,N,N,N,N,N)) ++
+    usingNMI.option(             MNRET->       List(N,N,Y,N,N,N,N,N,N,N,N)) ++
+    coreParams.haveCFlush.option(CFLUSH_D_L1-> List(N,N,N,N,N,N,N,N,N,N,N)) ++
+    usingSupervisor.option(      SRET->        List(N,N,Y,N,N,N,N,N,N,N,N)) ++
+    usingVM.option(              SFENCE_VMA->  List(N,N,N,N,N,Y,N,N,N,N,N)) ++
+    usingHypervisor.option(      HFENCE_VVMA-> List(N,N,N,N,N,N,Y,N,N,N,N)) ++
+    usingHypervisor.option(      HFENCE_GVMA-> List(N,N,N,N,N,N,N,Y,N,N,N)) ++
+    (if (usingHypervisor)        hlsv.map(_->  List(N,N,N,N,N,N,N,N,Y,N,N)) else Seq()) ++
+    coreParams.hasNACC.option(   NACCInstructions.ACALL-> List(N,N,N,N,N,N,N,N,N,Y,N)) ++
+    coreParams.hasNACC.option(   NACCInstructions.ARET->  List(N,N,N,N,N,N,N,N,N,N,Y))
+  val decoded_system_insn = {
+    val insn = io.rw.inst.getOrElse(ECALL.value.U | (io.rw.addr << 20))
     DecodeLogic(insn, decode_table(0)._2.map(x=>X), decode_table).map(system_insn && _.asBool)
   }
+  val insn_call :: insn_break :: insn_ret :: insn_cease :: insn_wfi :: _ :: _ :: _ :: _ :: insn_nacc_acall :: insn_nacc_aret :: Nil = decoded_system_insn
 
   for (io_dec <- io.decode) {
     val addr = io_dec.inst(31, 20)
@@ -918,8 +949,8 @@ class CSRFile(
     def decodeAny(m: LinkedHashMap[Int,Bits]): Bool = m.map { case(k: Int, _: Bits) => addr === k.U }.reduce(_||_)
     def decodeFast(s: Seq[Int]): Bool = DecodeLogic(addr, s.map(_.U), (read_mapping.toMap -- s).keys.toList.map(_.U))
 
-    val _ :: is_break :: is_ret :: _ :: is_wfi :: is_sfence :: is_hfence_vvma :: is_hfence_gvma :: is_hlsv :: Nil =
-      DecodeLogic(io_dec.inst, decode_table(0)._2.map(x=>X), decode_table).map(_.asBool)
+    val decoded_system = DecodeLogic(io_dec.inst, decode_table(0)._2.map(x=>X), decode_table).map(_.asBool)
+    val _ :: is_break :: is_ret :: _ :: is_wfi :: is_sfence :: is_hfence_vvma :: is_hfence_gvma :: is_hlsv :: is_nacc_acall :: is_nacc_aret :: Nil = decoded_system
     val is_counter = (addr.inRange(CSR.firstCtr.U, (CSR.firstCtr + CSR.nCtr).U) || addr.inRange(CSR.firstCtrH.U, (CSR.firstCtrH + CSR.nCtr).U))
 
     val allow_wfi = (!usingSupervisor).B || reg_mstatus.prv > PRV.S.U || !reg_mstatus.tw && (!reg_mstatus.v || !reg_hstatus.vtw)
@@ -957,7 +988,9 @@ class CSRFile(
       is_ret && addr(10) && addr(7) && !reg_debug ||
       (is_sfence || is_hfence_gvma) && !allow_sfence_vma ||
       is_hfence_vvma && !allow_hfence_vvma ||
-      is_hlsv && !allow_hlsv
+      is_hlsv && !allow_hlsv ||
+      is_nacc_acall && !naccAcallLegal ||
+      is_nacc_aret && reg_mstatus.prv =/= PRV.S.U
 
     io_dec.virtual_access_illegal := reg_mstatus.v && csr_exists && (
       CSR.mode(addr) === PRV.H.U ||
@@ -1037,7 +1070,8 @@ class CSRFile(
   io.gstatus.sd_rv32 := (xLen == 32).B && io.gstatus.sd
 
   val exception = insn_call || insn_break || io.exception
-  assert(PopCount(insn_ret :: insn_call :: insn_break :: io.exception :: Nil) <= 1.U, "these conditions must be mutually exclusive")
+  assert(PopCount(insn_ret :: insn_call :: insn_break :: insn_nacc_acall :: insn_nacc_aret :: io.exception :: Nil) <= 1.U,
+    "these conditions must be mutually exclusive")
 
   when (insn_wfi && !io.singleStep && !reg_debug) { reg_wfi := true.B }
   when (pending_interrupts.orR || io.interrupts.debug || exception) { reg_wfi := false.B }
@@ -1197,6 +1231,26 @@ class CSRFile(
     new_prv := ret_prv
     when (usingUser.B && ret_prv <= PRV.S.U) {
       reg_mstatus.mprv := false.B
+    }
+  }
+
+  if (coreParams.hasNACC) {
+    val naccNextPC = io.pc + 4.U
+    when (insn_nacc_acall) {
+      assert(naccAcallLegal, "ACALL reached CSR execution with invalid NACC state")
+      io.evec := encodeVirtualAddress(naccTrampoline, naccTrampoline)
+      naccState := (naccState & ~NACCState.StateMask.U(xLen.W)) |
+        NACCState.LinuxField.U(xLen.W) |
+        NACCState.PendingReturnMask.U(xLen.W)
+      naccTrampoline := naccNextPC.sextTo(xLen)
+    }.elsewhen (insn_nacc_aret) {
+      when (naccAretActive) {
+        io.evec := encodeVirtualAddress(naccTrampoline, naccTrampoline)
+        naccState := (naccState & ~(NACCState.StateMask | NACCState.PendingReturnMask).U(xLen.W)) |
+          NACCState.AgentField.U(xLen.W)
+      }.otherwise {
+        io.evec := naccNextPC
+      }
     }
   }
 
