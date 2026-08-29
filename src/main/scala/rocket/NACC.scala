@@ -1,5 +1,6 @@
 package freechips.rocketchip.rocket
 
+import chisel3._
 import chisel3.util.BitPat
 
 object NACCInstructions {
@@ -20,4 +21,21 @@ object NACCState {
   val PendingReturnMask = BigInt(1) << PendingReturnBit
   val AgentField = BigInt(Agent) << StateLow
   val LinuxField = BigInt(Linux) << StateLow
+
+  /** 只有ACALL/ARET定义的两种canonical lifecycle状态属于机密执行期。 */
+  def confidentialActive(value: UInt): Bool = {
+    val cidValid = value(CidBits - 1, 0).orR
+    val state = value(StateHigh, StateLow)
+    val pending = value(PendingReturnBit)
+    cidValid && ((state === Agent.U && !pending) || (state === Linux.U && pending))
+  }
+}
+
+object NACCBitmapTag {
+  val Width = 2
+
+  val Normal = 0
+  val RootL0 = 1
+  val PrivateData = 2
+  val PrivateCopyPending = 3
 }
