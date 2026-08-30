@@ -423,9 +423,6 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     * 那条外包给软件的不变量。
     */
   val naccAgentMode = if (coreParams.hasNACC) io.ptw.customCSRs.asStatusValue(NACCStatus.A) else false.B
-  /** 机密执行期。在 A-mode 下它与 `naccAgentMode` 是同一件事，保留名字以对应 bitmap
-    * 侧文档里的 top-root role gate 术语。 */
-  val naccConfidentialActive = naccAgentMode
   val naccRootPageAddress = satp.ppn << pgIdxBits
   val naccRootInBitmapTarget = if (coreParams.hasNACC) {
     inNACCBitmapTargetRange(naccRootPageAddress)
@@ -442,10 +439,26 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   } else {
     NACCBitmapTag.Normal.U
   }
+  /** top-root role gate：**只约束一个方向**——`A=1` 时根表必须是 `ROOT_L0` 页。
+    *
+    * 挡的是「Linux 把 `satp` 指向一张自己完全能写的普通页再进 A 世界」：那样 agent
+    * 看到的每一条映射都由 Linux 决定。有了这条，Linux 只能在 monitor 认可过的那些
+    * 根页表里选，选错只是调度错误。
+    *
+    * 反方向（`A=0` 时不许装 `ROOT_L0` 根表）**不成立，已删除**。世界切换不改 `satp`，
+    * 两个世界共用同一张根页表，因此 `A=0` 带着容器 PGD 运行是**正常且必需**的状态：
+    * Linux 要先在 `A=0` 时写 `satp` = 容器 PGD 才能 `SRET` 进去；`ECALL from AS` 退出
+    * 后 `satp` 不变，Linux 的 trap handler 就跑在这张 PGD 上——内核半存在的全部理由
+    * 正是这个。禁止它会让进入和退出两条路都在第一条指令上取指失败。
+    *
+    * 保护用户半的不是这条 gate，而是 `ROOT_L0` 的 sub-page 写权限：Linux 改不了
+    * entry 0..255，也就无法重映射 agent 的地址空间。允许 `A=0` 走这张页表，它至多
+    * 能沿着 agent 的下级页表走到 `PRIVATE_DATA` 页，而终端访问被 tag 拒绝。
+    */
   val naccRootAllowed = if (coreParams.hasNACC) {
-    Mux(naccConfidentialActive,
-      stage1_en && naccRootInBitmapTarget && naccRootTagKnown && naccRootTag === NACCBitmapTag.RootL0.U,
-      !naccRootInBitmapTarget || (naccRootTagKnown && naccRootTag === NACCBitmapTag.Normal.U))
+    !naccAgentMode ||
+      (stage1_en && naccRootInBitmapTarget && naccRootTagKnown &&
+        naccRootTag === NACCBitmapTag.RootL0.U)
   } else {
     true.B
   }
@@ -696,7 +709,9 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val bad_va =
     if (!usingVM || (minPgLevels == pgLevels && vaddrBits == vaddrBitsExtended)) false.B
     else vm_enabled && stage1_en && badVA(false)
-  val naccRootValidationMiss = coreParams.hasNACC.B && vm_enabled && !bad_va &&
+  // root tag 只有 `A=1` 时才被 `naccRootAllowed` 消费，因此也只在那时才去取。
+  // 否则 Linux 每次把 satp 切到 target range 内的普通 PGD 都要白做一次 bitmap load。
+  val naccRootValidationMiss = coreParams.hasNACC.B && vm_enabled && !bad_va && naccAgentMode &&
     naccRootInBitmapTarget && !naccRootTagKnown && !naccBitmapFatalApplies
   val naccRootDenied = coreParams.hasNACC.B && vm_enabled && !bad_va &&
     !naccRootValidationMiss && !naccRootAllowed && !naccBitmapFatalApplies
