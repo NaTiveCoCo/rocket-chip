@@ -80,3 +80,31 @@ object NACCStatus {
   val WriteMaskS: BigInt = ReadMaskS & StoredMask
   val WriteMaskAS: BigInt = ReadMaskAS & StoredMask
 }
+
+/** PFN bitmap 的 raw tag 编码，每个 4 KiB 物理页 2 bit。
+  *
+  * tag 是 final physical PFN 的属性，与虚拟地址、PTE permission 和 requester 都无关：
+  * 同一个物理页无论由哪条 VA、哪种 PTE 权限映射，读到的 raw tag 必须相同，只有可信
+  * M-mode 对 bitmap backing memory 的写入能改变它。因此 TLB entry 里缓存的是 **raw
+  * tag 本身**，而不是某次 privilege/state 下算出的最终权限——`A` 位变化后下一次 hit
+  * 用 live 状态重新计算，不需要仅为世界切换执行 `SFENCE.VMA`。
+  *
+  * 宽度保持 2 bit 而不加宽：这三个值加一个 lifecycle 恰好装下，而加宽到 1 byte 会把
+  * 一条 64 byte metadata cache line 的覆盖面从 1 MiB 缩到 256 KiB。代价是两条 monitor
+  * 的软件义务——串行化 tag 更新（4 个 PFN 共用一个 byte，跨 hart 并发 read-modify-write
+  * 会丢更新），以及把格式版本放在 bitmap 数组之外而不是每页里。
+  */
+object NACCBitmapTag {
+  val Width = 2
+
+  /** 公共/共享内存。target range 外「不施加额外限制」也用这个编码表示，但 target
+    * range 内的 `Normal` 必须来自真实的 bitmap read，不能用默认零值冒充。 */
+  val Normal = 0
+  /** 半分的根页表：读整页放行，写只放行内核半（Sv39 顶层 entry 256..511），
+    * 用户半 M-only。 */
+  val RootL0 = 1
+  /** agent 私有，含它自己的下级页表页与 SSA。 */
+  val PrivateData = 2
+  /** 迁移中的瞬态。 */
+  val PrivateCopyPending = 3
+}

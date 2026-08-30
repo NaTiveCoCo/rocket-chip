@@ -25,6 +25,12 @@ class PTWReq(implicit p: Parameters) extends CoreBundle()(p) {
   val need_gpa = Bool()
   val vstage1 = Bool()
   val stage2 = Bool()
+  /** 跳过PTE walk，仅查询给定physical PFN的NACC bitmap raw tag */
+  val naccBitmapOnly = coreParams.hasNACC.option(Bool())
+  /** bitmap-only请求的完整physical PFN */
+  val naccBitmapPPN = coreParams.hasNACC.option(UInt(ppnBits.W))
+  /** bitmap-only请求用于验证live satp top root，不得当作Bare tag response */
+  val naccRootValidationOnly = coreParams.hasNACC.option(Bool())
 }
 
 /** PTE info from L2TLB to TLB
@@ -51,6 +57,12 @@ class PTWResp(implicit p: Parameters) extends CoreBundle()(p) {
     * source: L2TLB
     */
   val pte = new PTE
+  /** NACC PFN bitmap的requester-independent raw tag */
+  val naccBitmapTag = coreParams.hasNACC.option(UInt(NACCBitmapTag.Width.W))
+  /** response来自bitmap-only请求；不得refill普通TLB/L2 entry */
+  val naccBitmapOnly = coreParams.hasNACC.option(Bool())
+  /** response完成live satp top-root raw-tag validation */
+  val naccRootValidationOnly = coreParams.hasNACC.option(Bool())
   /** pte pglevel */
   val level = UInt(log2Ceil(pgLevels).W)
   /** fragmented_superpage support */
@@ -80,6 +92,11 @@ class TLBPTWIO(implicit p: Parameters) extends CoreBundle()(p)
   val gstatus = Input(new MStatus())
   val pmp = Input(Vec(nPMPs, new PMP))
   val customCSRs = Flipped(coreParams.customCSRs)
+  /** per-hart、reset-only sticky bitmap fatal状态 */
+  val naccBitmapFatal = coreParams.hasNACC.option(Input(Bool()))
+  /** shared PTW已缓存live satp root的真实raw tag */
+  val naccRootTagValid = coreParams.hasNACC.option(Input(Bool()))
+  val naccRootTag = coreParams.hasNACC.option(Input(UInt(NACCBitmapTag.Width.W)))
 }
 /** PTW performance statistics */
 class PTWPerfEvents extends Bundle {
@@ -179,6 +196,7 @@ class L2TLBEntry(nSets: Int)(implicit p: Parameters) extends CoreBundle()(p)
   val w = Bool()
   /** whether the page is readable */
   val r = Bool()
+  val naccBitmapTag = coreParams.hasNACC.option(UInt(NACCBitmapTag.Width.W))
 
 }
 /** PTW contains L2TLB, and performs page table walk for high level TLB, and cache queries from L1 TLBs(I$, D$, RoCC)
@@ -218,6 +236,8 @@ class L2TLBEntry(nSets: Int)(implicit p: Parameters) extends CoreBundle()(p)
   */
 class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(p) {
   require(!coreParams.hasNACC || !usingHypervisor, "NACC does not support hypervisor translation")
+  require(!coreParams.hasNACC || (xLen == 64 && pgLevels == 3 && pgLevelBits == 9 && pgIdxBits == 12),
+    "NACC currently requires RV64 Sv39")
   val io = IO(new Bundle {
     /** to n TLB */
     val requestor = Flipped(Vec(n, new TLBPTWIO))
@@ -230,8 +250,18 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     val dpath = new DatapathPTWIO
   })
 
-  val s_ready :: s_req :: s_wait1 :: s_dummy1 :: s_wait2 :: s_wait3 :: s_dummy2 :: s_fragment_superpage :: Nil = Enum(8)
+  val stateValues = Enum(8 + (if (coreParams.hasNACC) 4 else 0))
+  val s_ready :: s_req :: s_wait1 :: s_dummy1 :: s_wait2 :: s_wait3 :: s_dummy2 :: s_fragment_superpage :: Nil = stateValues.take(8).toList
+  val naccBitmapStateValues = stateValues.drop(8)
+  val s_nacc_bitmap_req = if (coreParams.hasNACC) naccBitmapStateValues(0) else 0.U
+  val s_nacc_bitmap_wait1 = if (coreParams.hasNACC) naccBitmapStateValues(1) else 0.U
+  val s_nacc_bitmap_wait2 = if (coreParams.hasNACC) naccBitmapStateValues(2) else 0.U
+  val s_nacc_bitmap_wait3 = if (coreParams.hasNACC) naccBitmapStateValues(3) else 0.U
   val state = RegInit(s_ready)
+  val naccBitmapReq = if (coreParams.hasNACC) state === s_nacc_bitmap_req else false.B
+  val naccBitmapWait1 = if (coreParams.hasNACC) state === s_nacc_bitmap_wait1 else false.B
+  val naccBitmapWait2 = if (coreParams.hasNACC) state === s_nacc_bitmap_wait2 else false.B
+  val naccBitmapWait3 = if (coreParams.hasNACC) state === s_nacc_bitmap_wait3 else false.B
   val l2_refill_wire = Wire(Bool())
   /** Arbiter to arbite request from n TLB */
   val arb = Module(new Arbiter(Valid(new PTWReq), n))
@@ -266,6 +296,8 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   val resp_hw = Reg(Bool())
   val resp_hx = Reg(Bool())
   val resp_fragmented_superpage = Reg(Bool())
+  val naccBitmapFatal = coreParams.hasNACC.option(RegInit(false.B))
+  val naccBitmapFatalEvent = coreParams.hasNACC.option(WireDefault(false.B))
 
   /** tlb request */
   val r_req = Reg(new PTWReq)
@@ -274,6 +306,11 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   // to respond to L1TLB : l2_hit
   // to construct mem.req.addr
   val r_pte = Reg(new PTE)
+  val r_naccBitmapTag = coreParams.hasNACC.option(RegInit(NACCBitmapTag.Normal.U(NACCBitmapTag.Width.W)))
+  val r_naccBitmapPPN = coreParams.hasNACC.option(Reg(UInt(ppnBits.W)))
+  val naccRootTagCacheValid = coreParams.hasNACC.option(RegInit(false.B))
+  val naccRootTagCachePPN = coreParams.hasNACC.option(Reg(UInt(ppnBits.W)))
+  val naccRootTagCache = coreParams.hasNACC.option(Reg(UInt(NACCBitmapTag.Width.W)))
   val r_hgatp = Reg(new PTBR)
   // 2-stage pageLevel
   val aux_count = Reg(UInt(log2Ceil(pgLevels).W))
@@ -300,6 +337,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       mem_resp_data := resp.bits.data
     }
   }
+  val pte_mem_resp_valid = mem_resp_valid && !naccBitmapWait3
   // construct pte from mem.resp
   val (pte, invalid_paddr, invalid_gpa) = {
     val tmp = mem_resp_data.asTypeOf(new PTE())
@@ -351,6 +389,48 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   def makeFragmentedSuperpagePPN(ppn: UInt): Seq[UInt] = {
     (pgLevels-1 until 0 by -1).map(i => Cat(ppn >> (pgLevelBits*i), r_req.addr(((pgLevelBits*i) min vpnBits)-1, 0).padTo(pgLevelBits*i)))
   }
+  def inNACCBitmapTargetRange(addr: UInt): Bool = if (coreParams.hasNACC) {
+    val physicalAddress = addr.padTo(xLen)
+    physicalAddress >= io.dpath.customCSRs.naccBitmapTargetStartValue &&
+      physicalAddress < io.dpath.customCSRs.naccBitmapTargetEndValue
+  } else {
+    false.B
+  }
+  // R/W/X只在translation producer内区分terminal leaf、table和非法encoding；
+  // final physical result形成后，bitmap policy不再读取任何PTE permission字段。
+  val terminalPTEEncodingValid = if (coreParams.hasNACC) {
+    pte.v && (pte.r || (pte.x && !pte.w))
+  } else {
+    false.B
+  }
+  val finalPhysicalResultValid = if (coreParams.hasNACC) {
+    pte_mem_resp_valid && !traverse && terminalPTEEncodingValid &&
+      !invalid_paddr && !invalid_gpa && pte.reserved_for_future === 0.U
+  } else {
+    false.B
+  }
+  val naccBitmapLookupRequired = if (coreParams.hasNACC) {
+    finalPhysicalResultValid && count === (pgLevels-1).U &&
+      inNACCBitmapTargetRange(pte.ppn << pgIdxBits)
+  } else {
+    false.B
+  }
+  val naccTargetSuperpage = if (coreParams.hasNACC) {
+    val addressWidth = xLen + 1
+    val superpageStart = (pte.ppn << pgIdxBits).padTo(addressWidth)
+    val superpageSize = Mux(count === 0.U,
+      (BigInt(1) << 30).U(addressWidth.W),
+      (BigInt(1) << 21).U(addressWidth.W))
+    val superpageEnd = superpageStart + superpageSize
+    val targetStart = io.dpath.customCSRs.naccBitmapTargetStartValue.padTo(addressWidth)
+    val targetEnd = io.dpath.customCSRs.naccBitmapTargetEndValue.padTo(addressWidth)
+    finalPhysicalResultValid && count =/= (pgLevels-1).U &&
+      superpageStart < targetEnd && superpageEnd > targetStart
+  } else {
+    false.B
+  }
+  // Bare与post-walk lookup均先锁存physical PPN；公共loader只消费这一份稳定输入。
+  val naccBitmapLookupPPN = if (coreParams.hasNACC) r_naccBitmapPPN.get else 0.U
   /** PTECache caches non-leaf PTE
     * @param s2 true: 2-stage address translation
     */
@@ -375,7 +455,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     val hits = tags.map(_ === tag).asUInt & valid
     val hit = hits.orR && can_hit && !naccPTEAccessFault
     // refill with mem response
-    when (mem_resp_valid && traverse && can_refill && !hits.orR && !invalidated && !naccPTEAccessFault) {
+    when (pte_mem_resp_valid && traverse && can_refill && !hits.orR && !invalidated && !naccPTEAccessFault) {
       val r = Mux(valid.andR, plru.way, PriorityEncoder(~valid))
       valid := valid | UIntToOH(r)
       tags(r) := tag
@@ -409,7 +489,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   io.dpath.perf.l2miss := false.B
   io.dpath.perf.l2hit := false.B
   // l2tlb
-  val (l2_hit, l2_error, l2_pte, l2_tlb_ram) = if (coreParams.nL2TLBEntries == 0) (false.B, false.B, WireDefault(0.U.asTypeOf(new PTE)), None) else {
+  val (l2_hit, l2_error, l2_pte, l2_naccBitmapTag, l2_tlb_ram) = if (coreParams.nL2TLBEntries == 0) {
+    (false.B, false.B, WireDefault(0.U.asTypeOf(new PTE)), Option.empty[UInt], None)
+  } else {
     val code = new ParityCode
     require(isPow2(coreParams.nL2TLBEntries))
     require(isPow2(coreParams.nL2TLBWays))
@@ -439,7 +521,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     // replacement way
     r_l2_plru_way := (if (coreParams.nL2TLBWays > 1) l2_plru.way(r_idx) else 0.U)
     // refill with r_pte(leaf pte)
-    when (l2_refill && !invalidated) {
+    when (l2_refill && !invalidated && !naccBitmapFatal.getOrElse(false.B)) {
       val entry = Wire(new L2TLBEntry(nL2TLBSets))
       entry.ppn := r_pte.ppn
       entry.d := r_pte.d
@@ -448,6 +530,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       entry.x := r_pte.x
       entry.w := r_pte.w
       entry.r := r_pte.r
+      entry.naccBitmapTag.foreach(_ := r_naccBitmapTag.get)
       entry.tag := r_tag
       // if all the way are valid, use plru to select one way to be replaced,
       // otherwise use PriorityEncoderOH to select one
@@ -474,7 +557,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     }
 
     val s0_valid = !l2_refill && arb.io.out.fire
-    val s0_suitable = arb.io.out.bits.bits.vstage1 === arb.io.out.bits.bits.stage2 && !arb.io.out.bits.bits.need_gpa
+    val s0_suitable = arb.io.out.bits.bits.vstage1 === arb.io.out.bits.bits.stage2 &&
+      !arb.io.out.bits.bits.need_gpa &&
+      !arb.io.out.bits.bits.naccBitmapOnly.getOrElse(false.B)
     val s1_valid = RegNext(s0_valid && s0_suitable && arb.io.out.bits.valid)
     val s2_valid = RegNext(s1_valid)
     // read from tlb idx
@@ -513,7 +598,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       ccover(s2_hit && s2_hit_vec(way), s"L2_TLB_HIT_WAY$way", s"L2 TLB hit way$way")
     }
 
-    (s2_hit, s2_error, s2_pte, Some(ram))
+    val s2_naccBitmapTag = if (coreParams.hasNACC) Some(Mux1H(s2_hit_vec, s2_entry_vec.map(_.naccBitmapTag.get))) else None
+
+    (s2_hit, s2_error, s2_pte, s2_naccBitmapTag, Some(ram))
   }
 
   // if SFENCE occurs during walk, don't refill PTE cache or L2 TLB until next walk
@@ -521,14 +608,74 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   // mem request
   io.mem.keep_clock_enabled := false.B
 
-  io.mem.req.valid := (state === s_req || state === s_dummy1) && !naccPTEAccessFault
+  // bitmap的范围、大小和metadata地址必须先在宽于XLEN的域内完整计算；只有valid gate
+  // 通过后才允许截取低XLEN位形成Hella request，避免非法配置产生截断后的physical访问。
+  val naccBitmapCalcWidth = xLen + 2
+  val naccBitmapTargetStartWide = io.dpath.customCSRs.naccBitmapTargetStartValue.padTo(naccBitmapCalcWidth)
+  val naccBitmapTargetEndWide = io.dpath.customCSRs.naccBitmapTargetEndValue.padTo(naccBitmapCalcWidth)
+  val naccBitmapStorageBaseWide = io.dpath.customCSRs.naccBitmapStorageBaseValue.padTo(naccBitmapCalcWidth + 1)
+  val naccBitmapLookupPPNWide = naccBitmapLookupPPN.padTo(naccBitmapCalcWidth)
+  val naccBitmapLookupPageAddressWide = (naccBitmapLookupPPN << pgIdxBits).padTo(naccBitmapCalcWidth)
+  val naccBitmapAgentStartWide = io.dpath.customCSRs.naccSagentValue.padTo(naccBitmapCalcWidth)
+  val naccBitmapAgentEndWide = io.dpath.customCSRs.naccEagentValue.padTo(naccBitmapCalcWidth)
+
+  val naccBitmapTargetRangeOrdered = naccBitmapTargetStartWide < naccBitmapTargetEndWide
+  val naccBitmapLookupInTargetRange = naccBitmapTargetRangeOrdered &&
+    naccBitmapLookupPageAddressWide >= naccBitmapTargetStartWide &&
+    naccBitmapLookupPageAddressWide < naccBitmapTargetEndWide
+  val naccBitmapLookupInAgentRegion = naccBitmapLookupPageAddressWide >= naccBitmapAgentStartWide &&
+    naccBitmapLookupPageAddressWide < naccBitmapAgentEndWide
+
+  val naccBitmapTargetSpan = naccBitmapTargetEndWide - naccBitmapTargetStartWide
+  val naccBitmapPageCount = naccBitmapTargetSpan >> pgIdxBits
+  val naccBitmapPageCountRounded = naccBitmapPageCount +& 3.U
+  val naccBitmapPageCountRoundOverflow = naccBitmapPageCountRounded(naccBitmapPageCountRounded.getWidth - 1)
+  val naccBitmapBytes = naccBitmapPageCountRounded >> 2
+  val naccBitmapEndWithCarry = naccBitmapStorageBaseWide +& naccBitmapBytes
+  val naccBitmapEndOverflow = naccBitmapEndWithCarry(naccBitmapCalcWidth + 1)
+
+  val naccBitmapTargetStartPPNWide = naccBitmapTargetStartWide >> pgIdxBits
+  val naccBitmapPageIndexUnderflow = naccBitmapLookupPPNWide < naccBitmapTargetStartPPNWide
+  val naccBitmapPageIndex = naccBitmapLookupPPNWide - naccBitmapTargetStartPPNWide
+  val naccBitmapPageIndexInRange = !naccBitmapPageIndexUnderflow && naccBitmapPageIndex < naccBitmapPageCount
+  val naccBitmapByteOffset = naccBitmapPageIndex >> 2
+  val naccBitmapAddressWithCarry = naccBitmapStorageBaseWide +& naccBitmapByteOffset.padTo(naccBitmapCalcWidth + 1)
+  val naccBitmapAddressOverflow = naccBitmapAddressWithCarry(naccBitmapCalcWidth + 1)
+  val naccBitmapAddressInDerivedRange =
+    naccBitmapAddressWithCarry >= naccBitmapStorageBaseWide.padTo(naccBitmapCalcWidth + 2) &&
+    naccBitmapAddressWithCarry < naccBitmapEndWithCarry
+  val naccBitmapAddressFitsPAddr = if (paddrBits < naccBitmapAddressWithCarry.getWidth) {
+    !naccBitmapAddressWithCarry(naccBitmapAddressWithCarry.getWidth - 1, paddrBits).orR
+  } else {
+    true.B
+  }
+  // physicalLimit必须额外保留exclusive end位，不能用paddrBits位literal表示2^paddrBits。
+  val naccBitmapPhysicalCompareWidth = (naccBitmapCalcWidth + 2) max (paddrBits + 1)
+  val naccBitmapPhysicalLimit = (BigInt(1) << paddrBits).U(naccBitmapPhysicalCompareWidth.W)
+  val naccBitmapConfigWithinPhysicalLimit =
+    naccBitmapTargetStartWide.padTo(naccBitmapPhysicalCompareWidth) < naccBitmapPhysicalLimit &&
+    naccBitmapTargetEndWide.padTo(naccBitmapPhysicalCompareWidth) <= naccBitmapPhysicalLimit &&
+    naccBitmapStorageBaseWide.padTo(naccBitmapPhysicalCompareWidth) < naccBitmapPhysicalLimit &&
+    naccBitmapEndWithCarry.padTo(naccBitmapPhysicalCompareWidth) <= naccBitmapPhysicalLimit
+  val naccBitmapAddressWithinPhysicalLimit =
+    naccBitmapAddressWithCarry.padTo(naccBitmapPhysicalCompareWidth) < naccBitmapPhysicalLimit
+  val naccBitmapAddressValid = naccBitmapTargetRangeOrdered && naccBitmapLookupInTargetRange &&
+    !naccBitmapLookupInAgentRegion && naccBitmapPageIndexInRange &&
+    !naccBitmapPageCountRoundOverflow && !naccBitmapEndOverflow && !naccBitmapAddressOverflow &&
+    naccBitmapAddressInDerivedRange && naccBitmapAddressFitsPAddr &&
+    naccBitmapConfigWithinPhysicalLimit && naccBitmapAddressWithinPhysicalLimit
+  val naccBitmapAddress = naccBitmapAddressWithCarry(xLen-1, 0)
+  val naccBitmapBitOffset = Cat(naccBitmapPageIndex(1, 0), 0.U(1.W))
+
+  io.mem.req.valid := ((state === s_req || state === s_dummy1) && !naccPTEAccessFault) ||
+    (naccBitmapReq && naccBitmapAddressValid)
   io.mem.req.bits.phys := true.B
   io.mem.req.bits.cmd  := M_XRD
-  io.mem.req.bits.size := log2Ceil(xLen/8).U
+  io.mem.req.bits.size := Mux(naccBitmapReq, 0.U, log2Ceil(xLen/8).U)
   io.mem.req.bits.signed := false.B
-  io.mem.req.bits.addr := pte_addr
-  io.mem.req.bits.idx.foreach(_ := pte_addr)
-  io.mem.req.bits.dprv := PRV.S.U   // PTW accesses are S-mode by definition
+  io.mem.req.bits.addr := Mux(naccBitmapReq, naccBitmapAddress, pte_addr)
+  io.mem.req.bits.idx.foreach(_ := Mux(naccBitmapReq, naccBitmapAddress, pte_addr))
+  io.mem.req.bits.dprv := Mux(naccBitmapReq, PRV.M.U, PRV.S.U)
   io.mem.req.bits.dv := do_both_stages && !stage2
   io.mem.req.bits.tag := DontCare
   io.mem.req.bits.no_resp := false.B
@@ -537,7 +684,17 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   io.mem.req.bits.data := DontCare
   io.mem.req.bits.mask := DontCare
 
-  io.mem.s1_kill := l2_hit || (state =/= s_wait1) || resp_gf
+  if (coreParams.hasNACC) {
+    // invalid bitmap地址必须在PTW内fail closed；任何真正发出的request都必须经过完整valid gate。
+    when (naccBitmapReq && !naccBitmapAddressValid) {
+      assert(!io.mem.req.valid, "Invalid NACC bitmap address must not issue a memory request")
+    }
+    when (io.mem.req.fire && naccBitmapReq) {
+      assert(naccBitmapAddressValid, "NACC bitmap memory request bypassed address validation")
+    }
+  }
+
+  io.mem.s1_kill := l2_hit || !(state === s_wait1 || naccBitmapWait1) || resp_gf
   io.mem.s1_data := DontCare
   io.mem.s2_kill := false.B
 
@@ -566,7 +723,29 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     val insideRegion = pageStart >= regionStart && pageEnd <= regionEnd
     outsideRegion || insideRegion
   }
-  val naccHomogeneous = if (coreParams.hasNACC) naccPgLevelHomogeneous(count) else true.B
+  val naccBitmapPgLevelHomogeneous = if (coreParams.hasNACC) {
+    (0 until pgLevels).map { i =>
+      val addressWidth = xLen + 1
+      val pageSize = BigInt(1) << (pgIdxBits + ((pgLevels - 1 - i) * pgLevelBits))
+      val pageStart = (r_pte.ppn << pgIdxBits).padTo(addressWidth)
+      val pageEnd = pageStart + pageSize.U(addressWidth.W)
+      val agentStart = io.dpath.customCSRs.naccSagentValue.padTo(addressWidth)
+      val agentEnd = io.dpath.customCSRs.naccEagentValue.padTo(addressWidth)
+      val targetStart = io.dpath.customCSRs.naccBitmapTargetStartValue.padTo(addressWidth)
+      val targetEnd = io.dpath.customCSRs.naccBitmapTargetEndValue.padTo(addressWidth)
+      val insideAgentRegion = pageStart >= agentStart && pageEnd <= agentEnd
+      val outsideTargetRange = pageEnd <= targetStart || pageStart >= targetEnd
+      val insideTargetRange = pageStart >= targetStart && pageEnd <= targetEnd
+      insideAgentRegion || outsideTargetRange || insideTargetRange
+    }
+  } else {
+    Seq.fill(pgLevels)(true.B)
+  }
+  val naccHomogeneous = if (coreParams.hasNACC) {
+    naccPgLevelHomogeneous(count) && naccBitmapPgLevelHomogeneous(count)
+  } else {
+    true.B
+  }
   val homogeneous = pmaHomogeneous && pmpHomogeneous && naccHomogeneous
   // response to tlb
   for (i <- 0 until io.requestor.size) {
@@ -579,6 +758,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     io.requestor(i).resp.bits.hw := resp_hw
     io.requestor(i).resp.bits.hx := resp_hx
     io.requestor(i).resp.bits.pte := r_pte
+    io.requestor(i).resp.bits.naccBitmapTag.foreach(_ := r_naccBitmapTag.get)
+    io.requestor(i).resp.bits.naccBitmapOnly.foreach(_ := r_req.naccBitmapOnly.get)
+    io.requestor(i).resp.bits.naccRootValidationOnly.foreach(_ := r_req.naccRootValidationOnly.get)
     io.requestor(i).resp.bits.level := max_count
     io.requestor(i).resp.bits.homogeneous := homogeneous || pageGranularityPMPs.B
     io.requestor(i).resp.bits.fragmented_superpage := resp_fragmented_superpage && pageGranularityPMPs.B
@@ -605,6 +787,13 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     io.requestor(i).hstatus := io.dpath.hstatus
     io.requestor(i).gstatus := io.dpath.gstatus
     io.requestor(i).pmp := io.dpath.pmp
+    io.requestor(i).naccBitmapFatal.foreach(_ := naccBitmapFatal.get)
+    io.requestor(i).naccRootTagValid.foreach { valid =>
+      valid := naccRootTagCacheValid.get &&
+        naccRootTagCachePPN.get === io.dpath.ptbr.ppn &&
+        io.dpath.ptbr.mode(io.dpath.ptbr.mode.getWidth - 1)
+    }
+    io.requestor(i).naccRootTag.foreach(_ := naccRootTagCache.get)
   }
 
   // control state machine
@@ -622,7 +811,11 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
 
         r_req := arb.io.out.bits.bits
         r_req_dest := arb.io.chosen
-        next_state := Mux(arb.io.out.bits.valid, s_req, s_ready)
+        val naccBitmapOnly = arb.io.out.bits.bits.naccBitmapOnly.getOrElse(false.B)
+        next_state := Mux(
+          arb.io.out.bits.valid,
+          Mux(naccBitmapOnly, s_nacc_bitmap_req, s_req),
+          s_ready)
         stage2       := arb.io.out.bits.bits.stage2
         stage2_final := arb.io.out.bits.bits.stage2 && !arb.io.out.bits.bits.vstage1
         count       := Mux(arb.io.out.bits.bits.stage2, hgatp_initial_count, satp_initial_count)
@@ -637,9 +830,32 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
         resp_hw := true.B
         resp_hx := true.B
         resp_fragmented_superpage := false.B
+        r_naccBitmapTag.foreach(_ := NACCBitmapTag.Normal.U)
+        r_naccBitmapPPN.foreach(_ := arb.io.out.bits.bits.naccBitmapPPN.get)
         r_hgatp := io.dpath.hgatp
 
         assert(!arb.io.out.bits.bits.need_gpa || arb.io.out.bits.bits.stage2)
+        if (coreParams.hasNACC) {
+          when (arb.io.out.bits.valid && arb.io.out.bits.bits.naccRootValidationOnly.get) {
+            assert(naccBitmapOnly, "NACC root validation must use the bitmap-only transaction path")
+          }
+          when (arb.io.out.bits.valid && naccBitmapOnly) {
+            assert(!arb.io.out.bits.bits.need_gpa, "NACC bitmap-only request must not request GPA")
+            assert(!arb.io.out.bits.bits.vstage1, "NACC bitmap-only request must not enable VS-stage translation")
+            assert(!arb.io.out.bits.bits.stage2, "NACC bitmap-only request must not enable G-stage translation")
+            when (arb.io.out.bits.bits.naccRootValidationOnly.get) {
+              assert(arb.io.out.bits.bits.naccBitmapPPN.get === io.dpath.ptbr.ppn,
+                "NACC root validation must target the live satp root")
+            }
+          }
+          // 「在不在 A 世界」由 asstatus 的 A 位回答——硬件维护、软件写不进。
+          when (arb.io.out.bits.valid && !naccBitmapOnly &&
+            io.dpath.customCSRs.asStatusValue(NACCStatus.A)) {
+            assert(naccRootTagCacheValid.get && naccRootTagCachePPN.get === io.dpath.ptbr.ppn &&
+              naccRootTagCache.get === NACCBitmapTag.RootL0.U,
+              "NACC confidential walk reached PTW before validating a ROOT_L0 satp root")
+          }
+        }
       }
     }
     is (s_req) {
@@ -693,6 +909,28 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     }
   }
 
+  if (coreParams.hasNACC) {
+    switch (state) {
+      is (s_nacc_bitmap_req) {
+        when (!naccBitmapAddressValid) {
+          // 配置或派生地址非法时不进入memory pipeline，并进入不可恢复的fatal路径。
+          naccBitmapFatalEvent.foreach(_ := true.B)
+        }.otherwise {
+          next_state := Mux(io.mem.req.ready, s_nacc_bitmap_wait1, s_nacc_bitmap_req)
+        }
+      }
+      is (s_nacc_bitmap_wait1) {
+        next_state := s_nacc_bitmap_wait2
+      }
+      is (s_nacc_bitmap_wait2) {
+        next_state := s_nacc_bitmap_wait3
+        when (io.mem.s2_xcpt.ae.ld) {
+          naccBitmapFatalEvent.foreach(_ := true.B)
+        }
+      }
+    }
+  }
+
   val merged_pte = {
     val superpage_masks = (0 until pgLevels).map(i => ((BigInt(1) << pte.ppn.getWidth) - (BigInt(1) << (pgLevels-1-i)*pgLevelBits)).U)
     val superpage_mask = superpage_masks(Mux(stage2_final, max_count, (pgLevels-1).U))
@@ -711,7 +949,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     // 2-stage translation
     Mux(do_switch, makeHypervisorRootPTE(r_hgatp, pte.ppn, r_pte),
     // when mem respond, store mem.resp.pte
-    Mux(mem_resp_valid, Mux(!traverse && r_req.vstage1 && stage2, merged_pte, pte),
+    Mux(pte_mem_resp_valid, Mux(!traverse && r_req.vstage1 && stage2, merged_pte, pte),
     // fragment_superpage
     Mux(state === s_fragment_superpage && !homogeneous && count =/= (pgLevels - 1).U, makePTE(makeFragmentedSuperpagePPN(r_pte.ppn)(count), r_pte),
     // when tlb request come->request mem, use root address in satp(or vsatp,hgatp)
@@ -723,8 +961,11 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     next_state := s_ready
     resp_valid(r_req_dest) := true.B
     count := (pgLevels-1).U
+    for (dst <- r_naccBitmapTag; src <- l2_naccBitmapTag) {
+      dst := src
+    }
   }
-  when (mem_resp_valid) {
+  when (pte_mem_resp_valid) {
     assert(state === s_wait3)
     next_state := s_req
     when (do_both_stages && !stage2) {
@@ -755,12 +996,15 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
         }
       }.otherwise {
         // find a leaf pte, start l2 refill
-        l2_refill := success && count === (pgLevels-1).U && !r_req.need_gpa &&
+        l2_refill := success && count === (pgLevels-1).U && !naccBitmapLookupRequired && !r_req.need_gpa &&
           (!r_req.vstage1 && !r_req.stage2 ||
            do_both_stages && aux_count === (pgLevels-1).U && pte.isFullPerm())
         count := max_count
 
-        when (success && pageGranularityPMPs.B && !(count === (pgLevels-1).U && (!do_both_stages || aux_count === (pgLevels-1).U))) {
+        when (naccBitmapLookupRequired) {
+          r_naccBitmapPPN.foreach(_ := pte.ppn(ppnBits-1, 0))
+          next_state := s_nacc_bitmap_req
+        }.elsewhen (success && pageGranularityPMPs.B && !(count === (pgLevels-1).U && (!do_both_stages || aux_count === (pgLevels-1).U))) {
           next_state := s_fragment_superpage
         }.otherwise {
           next_state := s_ready
@@ -768,7 +1012,8 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
         }
 
         resp_ae_ptw := ae && ((count < (pgLevels-1).U && pte.table()) || (do_both_stages && !stage2_final))
-        resp_ae_final := ae && pte.leaf() && !(do_both_stages && !stage2_final)
+        resp_ae_final := (ae && pte.leaf() && !(do_both_stages && !stage2_final)) || naccTargetSuperpage
+        naccBitmapFatalEvent.foreach(_ := naccTargetSuperpage)
         resp_pf := pf && !stage2
         resp_gf := gf || (pf && stage2)
         resp_hr := !stage2 || (!pf && !gf && pte.ur())
@@ -777,9 +1022,35 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       }
     }
   }
+  when (mem_resp_valid && naccBitmapWait3) {
+    val shiftedTag = mem_resp_data(7, 0) >> naccBitmapBitOffset
+    r_naccBitmapTag.foreach(_ := shiftedTag(NACCBitmapTag.Width-1, 0))
+    when (r_req.naccRootValidationOnly.getOrElse(false.B) &&
+      !invalidated && !io.dpath.sfence.valid && !naccBitmapFatal.getOrElse(false.B)) {
+      naccRootTagCacheValid.foreach(_ := true.B)
+      naccRootTagCachePPN.foreach(_ := r_naccBitmapPPN.get)
+      naccRootTagCache.foreach(_ := shiftedTag(NACCBitmapTag.Width-1, 0))
+    }
+    l2_refill := !r_req.naccBitmapOnly.getOrElse(false.B) && !naccBitmapFatal.getOrElse(false.B)
+    next_state := s_ready
+    resp_valid(r_req_dest) := true.B
+  }
   when (io.mem.s2_nack) {
-    assert(state === s_wait2)
-    next_state := s_req
+    assert(state === s_wait2 || naccBitmapWait2)
+    next_state := Mux(naccBitmapWait2, s_nacc_bitmap_req, s_req)
+  }
+  if (coreParams.hasNACC) {
+    // fatal completion优先于SFENCE、kill/stale处理和s2_nack；sticky除reset外没有写0路径。
+    when (naccBitmapFatalEvent.get) {
+      naccBitmapFatal.get := true.B
+      resp_ae_final := true.B
+      l2_refill := false.B
+      next_state := s_ready
+      resp_valid(r_req_dest) := true.B
+    }
+    when (io.dpath.sfence.valid) {
+      naccRootTagCacheValid.get := false.B
+    }
   }
 
   when (do_switch) {
@@ -793,7 +1064,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   }
 
   for (i <- 0 until pgLevels) {
-    val leaf = mem_resp_valid && !traverse && count === i.U
+    val leaf = pte_mem_resp_valid && !traverse && count === i.U
     ccover(leaf && pte.v && !invalid_paddr && !invalid_gpa && pte.reserved_for_future === 0.U, s"L$i", s"successful page-table access, level $i")
     ccover(leaf && pte.v && invalid_paddr, s"L${i}_BAD_PPN_MSB", s"PPN too large, level $i")
     ccover(leaf && pte.v && invalid_gpa, s"L${i}_BAD_GPA_MSB", s"GPA too large, level $i")
@@ -802,7 +1073,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     if (i != pgLevels-1)
       ccover(leaf && !pte.v && mem_resp_data(0), s"L${i}_BAD_PPN_LSB", s"PPN LSBs not zero, level $i")
   }
-  ccover(mem_resp_valid && count === (pgLevels-1).U && pte.table(), s"TOO_DEEP", s"page table too deep")
+  ccover(pte_mem_resp_valid && count === (pgLevels-1).U && pte.table(), s"TOO_DEEP", s"page table too deep")
   ccover(io.mem.s2_nack, "NACK", "D$ nacked page-table access")
   ccover(state === s_wait2 && io.mem.s2_xcpt.ae.ld, "AE", "access exception while walking page table")
 
