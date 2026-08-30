@@ -45,7 +45,10 @@ class CustomCSRs(implicit p: Parameters) extends CoreBundle {
   def disableCoreClockGate = getOrElse(chickenCSR, _.value(2), false.B)
   def disableSpeculativeICacheRefill = getOrElse(chickenCSR, _.value(3), false.B)
   def suppressCorruptOnGrantData = getOrElse(chickenCSR, _.value(9), false.B)
-  def naccStateValue = 0.U(xLen.W)
+  // NACC A-mode。naccStatusValue 里的 `A` 位是 CSRFile 并入的执行状态镜像，
+  // 因此这个值可以直接用来判断「当前是否处于 A 世界」。
+  def naccStatusValue = 0.U(xLen.W)
+  def naccAentryValue = 0.U(xLen.W)
   def naccSagentValue = 0.U(xLen.W)
   def naccEagentValue = 0.U(xLen.W)
 

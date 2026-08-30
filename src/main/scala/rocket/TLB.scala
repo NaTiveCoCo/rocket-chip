@@ -421,7 +421,8 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   } else {
     false.B
   }
-  val naccAgentMode = if (coreParams.hasNACC) io.ptw.customCSRs.naccStateValue(49, 48) === 1.U else false.B
+  // 处于 A 世界（AS 或 AU）。`A` 位由 CSRFile 并入 nacc_status 的对外 value。
+  val naccAgentMode = if (coreParams.hasNACC) io.ptw.customCSRs.naccStatusValue(NACCStatus.A) else false.B
   val naccPrivilegeAllowed = priv === PRV.M.U || (priv === PRV.S.U && naccAgentMode)
   val mpu_priv = Mux[UInt](usingVM.B && (do_refill || io.req.bits.passthrough /* PTW */), PRV.S.U, Cat(io.ptw.status.debug, priv))
   val pmp = Module(new PMPChecker(lgMaxSize))

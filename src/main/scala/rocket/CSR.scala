@@ -814,42 +814,49 @@ class CSRFile(
     reg_custom(matches.head._2)
   }
 
-  val naccState = if (coreParams.hasNACC) {
-    existingCustomCSRValue(0x3f0)
+  // NACC A-mode 特权级模型。字段布局与掩码定义见 NACC.scala。
+  //
+  // `A` 是执行状态位而不是存储位：它随世界切换而变，软件写不进。`nacc_status`
+  // 的其余字段（MPA/SPA/ASPP/ASPIE/ASIE）用 BoomCustomCSRs 生成的那一份存储，
+  // 读写掩码在 §1.2 定义，由 naccStatusReadMask / naccStatusWriteMask 施加。
+  val reg_nacc_a = RegInit(false.B)
+
+  val naccStatus = if (coreParams.hasNACC) {
+    existingCustomCSRValue(NACCCSRs.nacc_status)
   } else {
     0.U(xLen.W)
   }
-  val naccTwinEntry = if (coreParams.hasNACC) {
-    existingCustomCSRValue(0x5c0)
-  } else {
-    0.U(xLen.W)
-  }
-  val naccTrampoline = if (coreParams.hasNACC) {
-    existingCustomCSRValue(0x5c1)
+  // `S → AS` 的入口 PC：M 可写，S 与 AS 均不可访问（§3.2 的硬件强制入口点）。
+  val naccAentry = if (coreParams.hasNACC) {
+    existingCustomCSRValue(NACCCSRs.nacc_aentry)
   } else {
     0.U(xLen.W)
   }
 
   if (coreParams.hasNACC) {
-    require(xLen > NACCState.PendingReturnBit, "NACC requires an XLEN wide enough for nacc_state")
+    require(xLen > NACCStatus.Width, "NACC requires an XLEN wide enough for nacc_status")
+    require(!usingHypervisor, "NACC and the hypervisor extension are mutually exclusive")
   }
-  val naccAcallLegal = if (coreParams.hasNACC) {
-    reg_mstatus.prv === PRV.S.U &&
-      naccState(NACCState.StateHigh, NACCState.StateLow) === NACCState.Agent.U &&
-      naccState(NACCState.CidBits - 1, 0).orR &&
-      !naccState(NACCState.PendingReturnBit) &&
-      naccTrampoline.orR
+
+  // 当前 mode 对 nacc_status 的读掩码。`A` 位由下面单独并入，因为它不在存储里。
+  val naccStatusReadMask = if (coreParams.hasNACC) {
+    Mux(reg_mstatus.prv === PRV.M.U, NACCStatus.ReadMaskM.U(xLen.W),
+      Mux(reg_nacc_a, NACCStatus.ReadMaskAS.U(xLen.W), NACCStatus.ReadMaskS.U(xLen.W)))
   } else {
-    false.B
+    0.U(xLen.W)
   }
-  val naccAretActive = if (coreParams.hasNACC) {
-    reg_mstatus.prv === PRV.S.U &&
-      naccState(NACCState.StateHigh, NACCState.StateLow) === NACCState.Linux.U &&
-      naccState(NACCState.CidBits - 1, 0).orR &&
-      naccState(NACCState.PendingReturnBit) &&
-      naccTrampoline.orR
+  val naccStatusWriteMask = if (coreParams.hasNACC) {
+    Mux(reg_mstatus.prv === PRV.M.U, NACCStatus.WriteMaskM.U(xLen.W),
+      Mux(reg_nacc_a, NACCStatus.WriteMaskAS.U(xLen.W), NACCStatus.WriteMaskS.U(xLen.W)))
   } else {
-    false.B
+    0.U(xLen.W)
+  }
+  // 对外可见的 nacc_status：存储位按掩码筛过，再并上 `A` 这个执行状态镜像。
+  val naccStatusVisible = if (coreParams.hasNACC) {
+    (naccStatus & naccStatusReadMask) |
+      Mux(reg_nacc_a, (BigInt(1) << NACCStatus.A).U(xLen.W), 0.U(xLen.W))
+  } else {
+    0.U(xLen.W)
   }
 
   if (usingHypervisor) {
@@ -922,26 +929,24 @@ class CSRFile(
 
   val system_insn = io.rw.cmd === CSR.I
   val hlsv = Seq(HLV_B, HLV_BU, HLV_H, HLV_HU, HLV_W, HLV_WU, HLV_D, HSV_B, HSV_H, HSV_W, HSV_D, HLVX_HU, HLVX_WU)
-  val decode_table = Seq(        ECALL->       List(Y,N,N,N,N,N,N,N,N,N,N),
-                                 EBREAK->      List(N,Y,N,N,N,N,N,N,N,N,N),
-                                 MRET->        List(N,N,Y,N,N,N,N,N,N,N,N),
-                                 CEASE->       List(N,N,N,Y,N,N,N,N,N,N,N),
-                                 WFI->         List(N,N,N,N,Y,N,N,N,N,N,N)) ++
-    usingDebug.option(           DRET->        List(N,N,Y,N,N,N,N,N,N,N,N)) ++
-    usingNMI.option(             MNRET->       List(N,N,Y,N,N,N,N,N,N,N,N)) ++
-    coreParams.haveCFlush.option(CFLUSH_D_L1-> List(N,N,N,N,N,N,N,N,N,N,N)) ++
-    usingSupervisor.option(      SRET->        List(N,N,Y,N,N,N,N,N,N,N,N)) ++
-    usingVM.option(              SFENCE_VMA->  List(N,N,N,N,N,Y,N,N,N,N,N)) ++
-    usingHypervisor.option(      HFENCE_VVMA-> List(N,N,N,N,N,N,Y,N,N,N,N)) ++
-    usingHypervisor.option(      HFENCE_GVMA-> List(N,N,N,N,N,N,N,Y,N,N,N)) ++
-    (if (usingHypervisor)        hlsv.map(_->  List(N,N,N,N,N,N,N,N,Y,N,N)) else Seq()) ++
-    coreParams.hasNACC.option(   NACCInstructions.ACALL-> List(N,N,N,N,N,N,N,N,N,Y,N)) ++
-    coreParams.hasNACC.option(   NACCInstructions.ARET->  List(N,N,N,N,N,N,N,N,N,N,Y))
+  val decode_table = Seq(        ECALL->       List(Y,N,N,N,N,N,N,N,N),
+                                 EBREAK->      List(N,Y,N,N,N,N,N,N,N),
+                                 MRET->        List(N,N,Y,N,N,N,N,N,N),
+                                 CEASE->       List(N,N,N,Y,N,N,N,N,N),
+                                 WFI->         List(N,N,N,N,Y,N,N,N,N)) ++
+    usingDebug.option(           DRET->        List(N,N,Y,N,N,N,N,N,N)) ++
+    usingNMI.option(             MNRET->       List(N,N,Y,N,N,N,N,N,N)) ++
+    coreParams.haveCFlush.option(CFLUSH_D_L1-> List(N,N,N,N,N,N,N,N,N)) ++
+    usingSupervisor.option(      SRET->        List(N,N,Y,N,N,N,N,N,N)) ++
+    usingVM.option(              SFENCE_VMA->  List(N,N,N,N,N,Y,N,N,N)) ++
+    usingHypervisor.option(      HFENCE_VVMA-> List(N,N,N,N,N,N,Y,N,N)) ++
+    usingHypervisor.option(      HFENCE_GVMA-> List(N,N,N,N,N,N,N,Y,N)) ++
+    (if (usingHypervisor)        hlsv.map(_->  List(N,N,N,N,N,N,N,N,Y)) else Seq())
   val decoded_system_insn = {
     val insn = io.rw.inst.getOrElse(ECALL.value.U | (io.rw.addr << 20))
     DecodeLogic(insn, decode_table(0)._2.map(x=>X), decode_table).map(system_insn && _.asBool)
   }
-  val insn_call :: insn_break :: insn_ret :: insn_cease :: insn_wfi :: _ :: _ :: _ :: _ :: insn_nacc_acall :: insn_nacc_aret :: Nil = decoded_system_insn
+  val insn_call :: insn_break :: insn_ret :: insn_cease :: insn_wfi :: _ :: _ :: _ :: _ :: Nil = decoded_system_insn
 
   for (io_dec <- io.decode) {
     val addr = io_dec.inst(31, 20)
@@ -950,7 +955,7 @@ class CSRFile(
     def decodeFast(s: Seq[Int]): Bool = DecodeLogic(addr, s.map(_.U), (read_mapping.toMap -- s).keys.toList.map(_.U))
 
     val decoded_system = DecodeLogic(io_dec.inst, decode_table(0)._2.map(x=>X), decode_table).map(_.asBool)
-    val _ :: is_break :: is_ret :: _ :: is_wfi :: is_sfence :: is_hfence_vvma :: is_hfence_gvma :: is_hlsv :: is_nacc_acall :: is_nacc_aret :: Nil = decoded_system
+    val _ :: is_break :: is_ret :: _ :: is_wfi :: is_sfence :: is_hfence_vvma :: is_hfence_gvma :: is_hlsv :: Nil = decoded_system
     val is_counter = (addr.inRange(CSR.firstCtr.U, (CSR.firstCtr + CSR.nCtr).U) || addr.inRange(CSR.firstCtrH.U, (CSR.firstCtrH + CSR.nCtr).U))
 
     val allow_wfi = (!usingSupervisor).B || reg_mstatus.prv > PRV.S.U || !reg_mstatus.tw && (!reg_mstatus.v || !reg_hstatus.vtw)
@@ -988,9 +993,7 @@ class CSRFile(
       is_ret && addr(10) && addr(7) && !reg_debug ||
       (is_sfence || is_hfence_gvma) && !allow_sfence_vma ||
       is_hfence_vvma && !allow_hfence_vvma ||
-      is_hlsv && !allow_hlsv ||
-      is_nacc_acall && !naccAcallLegal ||
-      is_nacc_aret && reg_mstatus.prv =/= PRV.S.U
+      is_hlsv && !allow_hlsv
 
     io_dec.virtual_access_illegal := reg_mstatus.v && csr_exists && (
       CSR.mode(addr) === PRV.H.U ||
@@ -1070,7 +1073,7 @@ class CSRFile(
   io.gstatus.sd_rv32 := (xLen == 32).B && io.gstatus.sd
 
   val exception = insn_call || insn_break || io.exception
-  assert(PopCount(insn_ret :: insn_call :: insn_break :: insn_nacc_acall :: insn_nacc_aret :: io.exception :: Nil) <= 1.U,
+  assert(PopCount(insn_ret :: insn_call :: insn_break :: io.exception :: Nil) <= 1.U,
     "these conditions must be mutually exclusive")
 
   when (insn_wfi && !io.singleStep && !reg_debug) { reg_wfi := true.B }
@@ -1088,26 +1091,15 @@ class CSRFile(
   // Match the trap-state update priority below and select only traps that actually enter S-mode.
   val trapToSupervisor = exception && !trapToDebug && !trapToNmiInt &&
     !delegateVS && delegate && nmie
-  val naccAgentMode = if (coreParams.hasNACC) {
-    naccState(49, 48) === 1.U
-  } else {
-    false.B
-  }
-  val naccProtectedTrap = trapToSupervisor && naccAgentMode &&
-    reg_mstatus.prv.isOneOf(PRV.U.U, PRV.S.U)
-  val naccTwinTarget = if (coreParams.hasNACC) {
-    encodeVirtualAddress(naccTwinEntry, naccTwinEntry)
-  } else {
-    0.U(vaddrBitsExtended.W)
-  }
+  // A 世界的 trap 目前一律退出到 Linux 世界（`AS → S`）：本阶段还没有 A 世界的中断
+  // 委派控制，因此没有「委派给 A 世界」的 trap，也就不需要 astvec 路由。委派与
+  // A 世界的中断委派控制与 `as*` trap CSR 属于后续增量。
+  //
+  // 关键性质：退出时把 agent 侧 PC 存进 nacc_aentry，Linux 只能从这里恢复 agent
+  // （§3.2 的硬件强制入口点），它自己的 sepc 对 `S → AS` 无效。
+  val naccExitToSupervisor = coreParams.hasNACC.B && trapToSupervisor && reg_nacc_a
 
-  when (naccProtectedTrap) {
-    // Do not fall back to stvec: keep selecting twin_entry and fail-stop on invalid configuration.
-    assert(naccTwinEntry.orR, "NACC protected trap redirect has zero twin_entry")
-  }
-
-  // twin_entry is the direct protected-trap target; do not apply the stvec vector offset.
-  io.evec := Mux(naccProtectedTrap, naccTwinTarget, tvec)
+  io.evec := tvec
 
   when (exception) {
     when (trapToDebug) {
@@ -1153,6 +1145,15 @@ class CSRFile(
       reg_mstatus.spp := reg_mstatus.prv
       reg_mstatus.sie := false.B
       new_prv := PRV.S.U
+      if (coreParams.hasNACC) {
+        // `AS → S`：SPA 记下来源世界，A 清 0，agent 侧 PC 存进 nacc_aentry。
+        // Linux 之后只能靠 SPA=1 + SRET 从 nacc_aentry 恢复 agent，选不了落点。
+        naccStatus := Mux(reg_nacc_a,
+          naccStatus | (BigInt(1) << NACCStatus.SPA).U(xLen.W),
+          naccStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W))
+        when (reg_nacc_a) { naccAentry := formEPC(io.pc) }
+        reg_nacc_a := false.B
+      }
     }.otherwise {
       reg_mstatus.v := false.B
       reg_mstatus.mpv := reg_mstatus.v
@@ -1166,6 +1167,14 @@ class CSRFile(
       reg_mstatus.mpp := trimPrivilege(reg_mstatus.prv)
       reg_mstatus.mie := false.B
       new_prv := PRV.M.U
+      if (coreParams.hasNACC) {
+        // trap 进 M：MPA 记下来源世界，A 清 0。M 靠 MRET 时的 MPA 决定是否回 A 世界。
+        naccStatus := Mux(reg_nacc_a,
+          naccStatus | (BigInt(1) << NACCStatus.MPA).U(xLen.W),
+          naccStatus & ~(BigInt(1) << NACCStatus.MPA).U(xLen.W))
+        when (reg_nacc_a) { naccAentry := formEPC(io.pc) }
+        reg_nacc_a := false.B
+      }
     }
   }
 
@@ -1234,23 +1243,17 @@ class CSRFile(
     }
   }
 
+  // `S → AS`：Linux 写 SPA=1 后执行 SRET。落点 PC 由硬件从 nacc_aentry 强制取用、
+  // 忽略 sepc，落点特权级一律是 AS——两者合起来让 Linux 决定「什么时候进」但决定
+  // 不了「进到哪」「以什么特权级进」。
   if (coreParams.hasNACC) {
-    val naccNextPC = io.pc + 4.U
-    when (insn_nacc_acall) {
-      assert(naccAcallLegal, "ACALL reached CSR execution with invalid NACC state")
-      io.evec := encodeVirtualAddress(naccTrampoline, naccTrampoline)
-      naccState := (naccState & ~NACCState.StateMask.U(xLen.W)) |
-        NACCState.LinuxField.U(xLen.W) |
-        NACCState.PendingReturnMask.U(xLen.W)
-      naccTrampoline := naccNextPC.sextTo(xLen)
-    }.elsewhen (insn_nacc_aret) {
-      when (naccAretActive) {
-        io.evec := encodeVirtualAddress(naccTrampoline, naccTrampoline)
-        naccState := (naccState & ~(NACCState.StateMask | NACCState.PendingReturnMask).U(xLen.W)) |
-          NACCState.AgentField.U(xLen.W)
-      }.otherwise {
-        io.evec := naccNextPC
-      }
+    val naccSpa = naccStatus(NACCStatus.SPA)
+    val naccEnterAgent = insn_ret && !io.rw.addr(9) && !reg_mstatus.prv(1) && naccSpa
+    when (naccEnterAgent) {
+      reg_nacc_a := true.B
+      new_prv := PRV.S.U
+      io.evec := readEPC(naccAentry)
+      naccStatus := naccStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W)
     }
   }
 
@@ -1259,10 +1262,16 @@ class CSRFile(
   io.status.cease := RegEnable(true.B, false.B, insn_cease)
   io.status.wfi := reg_wfi
 
-  for ((io, reg) <- io.customCSRs zip reg_custom) {
+  for (((io, reg), decl) <- io.customCSRs zip reg_custom zip customCSRs) {
     io.wen := false.B
     io.wdata := wdata
-    io.value := reg
+    // nacc_status 的 `A` 位不在存储里，是执行状态的镜像；在这里并进对外的 value，
+    // 使 TLB/PTW 与软件读到的是同一个 live 值。
+    if (coreParams.hasNACC && decl.id == NACCCSRs.nacc_status) {
+      io.value := reg | Mux(reg_nacc_a, (BigInt(1) << NACCStatus.A).U(xLen.W), 0.U(xLen.W))
+    } else {
+      io.value := reg
+    }
   }
 
   for ((io, reg) <- io.roccCSRs zip reg_rocc) {
