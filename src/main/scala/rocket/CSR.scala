@@ -816,44 +816,44 @@ class CSRFile(
 
   // NACC A-mode 特权级模型。字段布局与掩码定义见 NACC.scala。
   //
-  // `A` 是执行状态位而不是存储位：它随世界切换而变，软件写不进。`nacc_status`
+  // `A` 是执行状态位而不是存储位：它随世界切换而变，软件写不进。`asstatus`
   // 的其余字段（MPA/SPA/ASPP/ASPIE/ASIE）用 BoomCustomCSRs 生成的那一份存储，
-  // 读写掩码在 §1.2 定义，由 naccStatusReadMask / naccStatusWriteMask 施加。
+  // 读写掩码在 §1.2 定义，由 asStatusReadMask / asStatusWriteMask 施加。
   val reg_nacc_a = RegInit(false.B)
 
-  val naccStatus = if (coreParams.hasNACC) {
-    existingCustomCSRValue(NACCCSRs.nacc_status)
+  val asStatus = if (coreParams.hasNACC) {
+    existingCustomCSRValue(NACCCSRs.asstatus)
   } else {
     0.U(xLen.W)
   }
   // `S → AS` 的入口 PC：M 可写，S 与 AS 均不可访问（§3.2 的硬件强制入口点）。
-  val naccAentry = if (coreParams.hasNACC) {
-    existingCustomCSRValue(NACCCSRs.nacc_aentry)
+  val asEpc = if (coreParams.hasNACC) {
+    existingCustomCSRValue(NACCCSRs.asepc)
   } else {
     0.U(xLen.W)
   }
 
   if (coreParams.hasNACC) {
-    require(xLen > NACCStatus.Width, "NACC requires an XLEN wide enough for nacc_status")
+    require(xLen > NACCStatus.Width, "NACC requires an XLEN wide enough for asstatus")
     require(!usingHypervisor, "NACC and the hypervisor extension are mutually exclusive")
   }
 
-  // 当前 mode 对 nacc_status 的读掩码。`A` 位由下面单独并入，因为它不在存储里。
-  val naccStatusReadMask = if (coreParams.hasNACC) {
+  // 当前 mode 对 asstatus 的读掩码。`A` 位由下面单独并入，因为它不在存储里。
+  val asStatusReadMask = if (coreParams.hasNACC) {
     Mux(reg_mstatus.prv === PRV.M.U, NACCStatus.ReadMaskM.U(xLen.W),
       Mux(reg_nacc_a, NACCStatus.ReadMaskAS.U(xLen.W), NACCStatus.ReadMaskS.U(xLen.W)))
   } else {
     0.U(xLen.W)
   }
-  val naccStatusWriteMask = if (coreParams.hasNACC) {
+  val asStatusWriteMask = if (coreParams.hasNACC) {
     Mux(reg_mstatus.prv === PRV.M.U, NACCStatus.WriteMaskM.U(xLen.W),
       Mux(reg_nacc_a, NACCStatus.WriteMaskAS.U(xLen.W), NACCStatus.WriteMaskS.U(xLen.W)))
   } else {
     0.U(xLen.W)
   }
-  // 对外可见的 nacc_status：存储位按掩码筛过，再并上 `A` 这个执行状态镜像。
-  val naccStatusVisible = if (coreParams.hasNACC) {
-    (naccStatus & naccStatusReadMask) |
+  // 对外可见的 asstatus：存储位按掩码筛过，再并上 `A` 这个执行状态镜像。
+  val asStatusVisible = if (coreParams.hasNACC) {
+    (asStatus & asStatusReadMask) |
       Mux(reg_nacc_a, (BigInt(1) << NACCStatus.A).U(xLen.W), 0.U(xLen.W))
   } else {
     0.U(xLen.W)
@@ -1095,7 +1095,7 @@ class CSRFile(
   // 委派控制，因此没有「委派给 A 世界」的 trap，也就不需要 astvec 路由。委派与
   // A 世界的中断委派控制与 `as*` trap CSR 属于后续增量。
   //
-  // 关键性质：退出时把 agent 侧 PC 存进 nacc_aentry，Linux 只能从这里恢复 agent
+  // 关键性质：退出时把 agent 侧 PC 存进 asepc，Linux 只能从这里恢复 agent
   // （§3.2 的硬件强制入口点），它自己的 sepc 对 `S → AS` 无效。
   val naccExitToSupervisor = coreParams.hasNACC.B && trapToSupervisor && reg_nacc_a
 
@@ -1146,12 +1146,18 @@ class CSRFile(
       reg_mstatus.sie := false.B
       new_prv := PRV.S.U
       if (coreParams.hasNACC) {
-        // `AS → S`：SPA 记下来源世界，A 清 0，agent 侧 PC 存进 nacc_aentry。
-        // Linux 之后只能靠 SPA=1 + SRET 从 nacc_aentry 恢复 agent，选不了落点。
-        naccStatus := Mux(reg_nacc_a,
-          naccStatus | (BigInt(1) << NACCStatus.SPA).U(xLen.W),
-          naccStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W))
-        when (reg_nacc_a) { naccAentry := formEPC(io.pc) }
+        // 世界退出：SPA 记下来源世界，A 清 0，agent 侧 PC 存进 asepc。
+        // Linux 之后只能靠 SPA=1 + SRET 从 asepc 恢复 agent，选不了落点。
+        asStatus := Mux(reg_nacc_a,
+          asStatus | (BigInt(1) << NACCStatus.SPA).U(xLen.W),
+          asStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W))
+        when (reg_nacc_a) {
+          asEpc := formEPC(io.pc)
+          // sepc 必须不带 agent 的 PC。它对 S 可读，Linux 一读就拿到 agent 的代码
+          // 地址，隐藏 asepc 就白做了；而且它对 S 可写，若返回走 sepc，Linux 就
+          // 能选择 agent 从哪里恢复。返回不走 sepc，故这里直接清零。
+          reg_sepc := 0.U
+        }
         reg_nacc_a := false.B
       }
     }.otherwise {
@@ -1169,10 +1175,10 @@ class CSRFile(
       new_prv := PRV.M.U
       if (coreParams.hasNACC) {
         // trap 进 M：MPA 记下来源世界，A 清 0。M 靠 MRET 时的 MPA 决定是否回 A 世界。
-        naccStatus := Mux(reg_nacc_a,
-          naccStatus | (BigInt(1) << NACCStatus.MPA).U(xLen.W),
-          naccStatus & ~(BigInt(1) << NACCStatus.MPA).U(xLen.W))
-        when (reg_nacc_a) { naccAentry := formEPC(io.pc) }
+        asStatus := Mux(reg_nacc_a,
+          asStatus | (BigInt(1) << NACCStatus.MPA).U(xLen.W),
+          asStatus & ~(BigInt(1) << NACCStatus.MPA).U(xLen.W))
+        when (reg_nacc_a) { asEpc := formEPC(io.pc) }
         reg_nacc_a := false.B
       }
     }
@@ -1243,17 +1249,17 @@ class CSRFile(
     }
   }
 
-  // `S → AS`：Linux 写 SPA=1 后执行 SRET。落点 PC 由硬件从 nacc_aentry 强制取用、
+  // `S → AS`：Linux 写 SPA=1 后执行 SRET。落点 PC 由硬件从 asepc 强制取用、
   // 忽略 sepc，落点特权级一律是 AS——两者合起来让 Linux 决定「什么时候进」但决定
   // 不了「进到哪」「以什么特权级进」。
   if (coreParams.hasNACC) {
-    val naccSpa = naccStatus(NACCStatus.SPA)
+    val naccSpa = asStatus(NACCStatus.SPA)
     val naccEnterAgent = insn_ret && !io.rw.addr(9) && !reg_mstatus.prv(1) && naccSpa
     when (naccEnterAgent) {
       reg_nacc_a := true.B
       new_prv := PRV.S.U
-      io.evec := readEPC(naccAentry)
-      naccStatus := naccStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W)
+      io.evec := readEPC(asEpc)
+      asStatus := asStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W)
     }
   }
 
@@ -1265,9 +1271,9 @@ class CSRFile(
   for (((io, reg), decl) <- io.customCSRs zip reg_custom zip customCSRs) {
     io.wen := false.B
     io.wdata := wdata
-    // nacc_status 的 `A` 位不在存储里，是执行状态的镜像；在这里并进对外的 value，
+    // asstatus 的 `A` 位不在存储里，是执行状态的镜像；在这里并进对外的 value，
     // 使 TLB/PTW 与软件读到的是同一个 live 值。
-    if (coreParams.hasNACC && decl.id == NACCCSRs.nacc_status) {
+    if (coreParams.hasNACC && decl.id == NACCCSRs.asstatus) {
       io.value := reg | Mux(reg_nacc_a, (BigInt(1) << NACCStatus.A).U(xLen.W), 0.U(xLen.W))
     } else {
       io.value := reg
