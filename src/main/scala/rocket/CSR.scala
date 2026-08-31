@@ -975,7 +975,32 @@ class CSRFile(
     val csr_addr_legal = reg_mstatus.prv >= CSR.mode(addr) ||
       usingHypervisor.B && !reg_mstatus.v && reg_mstatus.prv === PRV.S.U && CSR.mode(addr) === PRV.H.U
     val csr_exists = decodeAny(read_mapping)
+
+    /** A 世界的 trap CSR（astvec/asepc/ascause/astval/asscratch）只有 `A=1` 或 M 可访问。
+      *
+      * 光靠地址位判不出来：这几个编号落在 0x5c0–0x5c4，地址 bit[9:8] 自称 supervisor，
+      * 而 AS 与 Linux **特权级相同**（都是 S），唯一的区别是 A 位。所以标准的
+      * `prv >= CSR.mode(addr)` 对 Linux 恒成立，必须另加这一项。
+      *
+      * 少了它，Linux 就能读 asepc（拿到 agent 被中断时的 PC，泄露代码地址与执行位置），
+      * 更严重的是能写 asepc——而 SRET 进 A 世界时硬件强制从 asepc 取落点，于是 Linux
+      * 可以任选一个地址让 agent 从那里开始执行。RISC-V 有 C 扩展，跳转目标 2 字节对齐
+      * 即可，落点可以设在一条 32 位指令的中间，用 agent 自己的机器码字节重新切分出
+      * 另一条指令流——agent 里根本不需要存在那段逻辑。「Linux 决定何时恢复 agent，
+      * 但决定不了恢复到哪」这条性质完全押在这个判定上。
+      *
+      * AU 不需要单独处理：它是 U-mode，`prv >= CSR.mode(addr)` 已经把它挡在外面，
+      * 需要这些值时由 AS 转告。
+      */
+    val naccATrapCSRDenied = if (coreParams.hasNACC) {
+      val isATrapCSR = NACCCSRs.aTrapCSRs.map(id => addr === id.U).reduce(_ || _)
+      isATrapCSR && !reg_nacc_a && reg_mstatus.prv =/= PRV.M.U
+    } else {
+      false.B
+    }
+
     io_dec.read_illegal := !csr_addr_legal ||
+      naccATrapCSRDenied ||
       !csr_exists ||
       ((addr === CSRs.satp.U || addr === CSRs.hgatp.U) && !allow_sfence_vma) ||
       is_counter && !allow_counter ||
