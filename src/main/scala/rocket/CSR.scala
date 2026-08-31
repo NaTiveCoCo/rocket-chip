@@ -1232,21 +1232,61 @@ class CSRFile(
   when (insn_ret) {
     val ret_prv = WireInit(UInt(), DontCare)
     when (usingSupervisor.B && !io.rw.addr(9)) {
-      when (!reg_mstatus.v) {
-        reg_mstatus.sie := reg_mstatus.spie
-        reg_mstatus.spie := true.B
-        reg_mstatus.spp := PRV.U.U
-        ret_prv := reg_mstatus.spp
-        reg_mstatus.v := usingHypervisor.B && reg_hstatus.spv
-        io.evec := readEPC(reg_sepc)
-        reg_hstatus.spv := false.B
-      }.otherwise {
-        reg_vsstatus.sie := reg_vsstatus.spie
-        reg_vsstatus.spie := true.B
-        reg_vsstatus.spp := PRV.U.U
-        ret_prv := reg_vsstatus.spp
-        reg_mstatus.v := usingHypervisor.B
-        io.evec := readEPC(reg_vsepc)
+      // 上游原有的 supervisor 返回路径（S 与 VS 两个方向），body 一字未改。抽成一个
+      // 局部 def，只是为了让下面的 A 世界那一臂能用 Scala 层面的 if 完全排除掉：
+      // hasNACC=false 时，这里生成的 when 链与上游逐字一致，A 世界的代码根本不参与
+      // elaboration（它还必须如此——hasNACC=false 时 asStatus / asEpc 是常量而不是
+      // Reg，对它们赋值会直接 elaboration 报错）。
+      def stockSupervisorRet(): Unit = {
+        when (!reg_mstatus.v) {
+          reg_mstatus.sie := reg_mstatus.spie
+          reg_mstatus.spie := true.B
+          reg_mstatus.spp := PRV.U.U
+          ret_prv := reg_mstatus.spp
+          reg_mstatus.v := usingHypervisor.B && reg_hstatus.spv
+          io.evec := readEPC(reg_sepc)
+          reg_hstatus.spv := false.B
+        }.otherwise {
+          reg_vsstatus.sie := reg_vsstatus.spie
+          reg_vsstatus.spie := true.B
+          reg_vsstatus.spp := PRV.U.U
+          ret_prv := reg_vsstatus.spp
+          reg_mstatus.v := usingHypervisor.B
+          io.evec := readEPC(reg_vsepc)
+        }
+      }
+
+      if (coreParams.hasNACC) {
+        // `AS → AU`：A=1 时执行的 SRET 是 agent monitor 自己在往 confidential
+        // container 返回，走的必须是 A 世界自己的那一套 trap 状态。
+        //
+        // 为什么这一臂必须长在 when 链里，而不能像世界进入方向（`S → AS`）那样在
+        // insn_ret 块之后做「后置覆盖」：后置覆盖只改得动 io.evec / new_prv 这类
+        // Wire（末次赋值生效），改不掉 stock supervisor 臂已经落到
+        // reg_mstatus.sie / spie / spp 上的寄存器赋值。那三条只要执行过，AS 每做
+        // 一次 SRET 就把非 A 世界（Linux）的 sstatus 冲掉一次。所以必须在这里就把
+        // stock 臂整个挡住，让它压根不产生那些赋值。
+        //
+        // 返回特权级取 asstatus.SPP 而不是 sstatus.SPP，落点取 asepc 而不是 sepc：
+        // 后两者都是非 A 世界的 S 可写的，拿它们决定 agent 返回到哪、以什么特权级
+        // 返回，等于把 A 世界的控制流交给不可信的一侧。A 世界的返回状态只能来自
+        // A 世界自己的 CSR。
+        when (reg_nacc_a) {
+          // 只推 A 侧 trap 状态，完全不碰 reg_mstatus。三个字段必须在同一条赋值里
+          // 算完——Chisel 对同一信号多次赋值是末次生效，拆成三条会互相覆盖只剩最后
+          // 一条。先清掉整个 ATrapMask（SPP/SPIE/SIE），再写回 SIE := 旧 SPIE、
+          // SPIE := 1；SPP 就保持被清成的 0（PRV.U），对应「返回 AU」。
+          asStatus := (asStatus & ~NACCStatus.ATrapMask.U(xLen.W)) |
+            Mux(asStatus(NACCStatus.SPIE), (BigInt(1) << NACCStatus.SIE).U(xLen.W), 0.U(xLen.W)) |
+            (BigInt(1) << NACCStatus.SPIE).U(xLen.W)
+          ret_prv := Mux(asStatus(NACCStatus.SPP), PRV.S.U(PRV.SZ.W), PRV.U.U(PRV.SZ.W))
+          io.evec := readEPC(asEpc)
+          // reg_nacc_a 不赋值：AS → AU 仍在 A 世界内部，`A` 保持 1。
+        }.otherwise {
+          stockSupervisorRet()
+        }
+      } else {
+        stockSupervisorRet()
       }
     }.elsewhen (usingDebug.B && io.rw.addr(10) && io.rw.addr(7)) {
       ret_prv := reg_dcsr.prv

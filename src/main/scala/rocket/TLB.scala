@@ -713,8 +713,37 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   // 否则 Linux 每次把 satp 切到 target range 内的普通 PGD 都要白做一次 bitmap load。
   val naccRootValidationMiss = coreParams.hasNACC.B && vm_enabled && !bad_va && naccAgentMode &&
     naccRootInBitmapTarget && !naccRootTagKnown && !naccBitmapFatalApplies
-  val naccRootDenied = coreParams.hasNACC.B && vm_enabled && !bad_va &&
-    !naccRootValidationMiss && !naccRootAllowed && !naccBitmapFatalApplies
+  /** `A=1` 但 stage-1 分页未启用（`satp.MODE = Bare`）时一律拒绝。
+    *
+    * **为什么必须与 root role gate 并列，而不能塞进它的 `vm_enabled` 前提里**：
+    * `vm_enabled = (stage1_en || stage2_en) && priv_uses_vm && !passthrough`。
+    * `satp.MODE = Bare` 时 `stage1_en` 为假，非虚拟化下 `vm_enabled` 随之为假，
+    * 下面 `naccRootDenied` 的第一个 disjunct 恒为假——**root gate 整个不评估**。
+    * 也就是说，只要先把 `satp` 切回 Bare 再进 A 世界，「根表必须是 `ROOT_L0`」
+    * 这条检查就被完整绕开了。所以这个 disjunct 必须自带前提、独立成立。
+    *
+    * **为什么 Bare 下只能拒绝**：`A=1` 必须跑在 monitor 认可过的根页表上，这是
+    * 整个模型的安全地基。不分页时根本没有根页表可查，不可信的 S-mode 软件不需要
+    * 伪造任何 PTE，agent 看到的整个地址空间就直接等于物理地址空间、完全由它决定；
+    * 连带地，Agent region 的准入判据把「`A=1` 的 S-mode」视为可信，于是 Agent
+    * region 也一并敞开。这里不存在「先放行、事后补检查」的中间状态，唯一正确的
+    * 答案是拒绝。
+    *
+    * 各个前提分别挡住谁：
+    *   - `naccAgentMode`：`A=0` 时本条恒为假、零影响。普通 Linux 在早期 boot 用
+    *     `satp = Bare` 跑是完全合法的，绝不能因此 fault。
+    *   - `priv_uses_vm`：M-effective 的访问本来就不经 stage-1 翻译，不受本条约束。
+    *   - `!passthrough`：PTW 自己的 physical 访问不受本条约束。
+    *   - `!naccBitmapFatalApplies`：与另一个 disjunct 一致，sticky fatal 优先。
+    * 不必重复 `!bad_va`：`bad_va` 蕴含 `stage1_en`，本条成立时它必为假。
+    */
+  val naccRootStage1Missing = coreParams.hasNACC.B && naccAgentMode &&
+    priv_uses_vm && !stage1_en && !io.req.bits.passthrough && !naccBitmapFatalApplies
+  /** root gate 的总拒绝信号。两个 disjunct 走同一条汇合路径：抑制同周期的
+    * page fault 与 miss，改为产出 access fault。 */
+  val naccRootDenied = (coreParams.hasNACC.B && vm_enabled && !bad_va &&
+    !naccRootValidationMiss && !naccRootAllowed && !naccBitmapFatalApplies) ||
+    naccRootStage1Missing
 
   val cmd_lrsc = usingAtomics.B && io.req.bits.cmd.isOneOf(M_XLR, M_XSC)
   val cmd_amo_logical = usingAtomics.B && isAMOLogical(io.req.bits.cmd)
