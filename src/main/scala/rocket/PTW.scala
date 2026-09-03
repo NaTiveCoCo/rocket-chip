@@ -368,14 +368,6 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     //use vpn slice as offset
     raw_pte_addr.apply(size.min(raw_pte_addr.getWidth) - 1, 0)
   }
-  def inNACCAgentRegion(addr: UInt): Bool = if (coreParams.hasNACC) {
-    val physicalAddress = addr.padTo(xLen)
-    physicalAddress >= io.dpath.customCSRs.naccSagentValue &&
-      physicalAddress < io.dpath.customCSRs.naccEagentValue
-  } else {
-    false.B
-  }
-  val naccPTEAccessFault = inNACCAgentRegion(pte_addr)
   /** stage2_pte_cache input addr */
   val stage2_pte_cache_addr = if (!usingHypervisor) 0.U else {
     val vpn_idxs = (0 until pgLevels - 1).map { i =>
@@ -453,9 +445,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       else Cat(r_req.vstage1, pte_addr.padTo(if (usingHypervisor) vaddrBits else paddrBits))
 
     val hits = tags.map(_ === tag).asUInt & valid
-    val hit = hits.orR && can_hit && !naccPTEAccessFault
+    val hit = hits.orR && can_hit
     // refill with mem response
-    when (pte_mem_resp_valid && traverse && can_refill && !hits.orR && !invalidated && !naccPTEAccessFault) {
+    when (pte_mem_resp_valid && traverse && can_refill && !hits.orR && !invalidated) {
       val r = Mux(valid.andR, plru.way, PriorityEncoder(~valid))
       valid := valid | UIntToOH(r)
       tags(r) := tag
@@ -667,7 +659,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   val naccBitmapAddress = naccBitmapAddressWithCarry(xLen-1, 0)
   val naccBitmapBitOffset = Cat(naccBitmapPageIndex(1, 0), 0.U(1.W))
 
-  io.mem.req.valid := ((state === s_req || state === s_dummy1) && !naccPTEAccessFault) ||
+  io.mem.req.valid := (state === s_req || state === s_dummy1) ||
     (naccBitmapReq && naccBitmapAddressValid)
   io.mem.req.bits.phys := true.B
   io.mem.req.bits.cmd  := M_XRD
@@ -848,9 +840,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
                 "NACC root validation must target the live satp root")
             }
           }
-          // 「在不在 A 世界」由 asstatus 的 A 位回答——硬件维护、软件写不进。
+          // PTW 请求采用 data effective world；这也覆盖 MPRV+MPP+MPA。
           when (arb.io.out.bits.valid && !naccBitmapOnly &&
-            io.dpath.customCSRs.asStatusValue(NACCStatus.A)) {
+            io.dpath.customCSRs.asStatusValue(NACCStatus.InternalDataA)) {
             assert(naccRootTagCacheValid.get && naccRootTagCachePPN.get === io.dpath.ptbr.ppn &&
               naccRootTagCache.get === NACCBitmapTag.RootL0.U,
               "NACC confidential walk reached PTW before validating a ROOT_L0 satp root")
@@ -863,11 +855,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
         gpa_pgoff := Mux(aux_count === (pgLevels-1).U, r_req.addr << (xLen/8).log2, stage2_pte_cache_addr)
       }
       // pte_cache hit
-      when (naccPTEAccessFault) {
-        resp_ae_ptw := true.B
-        next_state := s_ready
-        resp_valid(r_req_dest) := true.B
-      }.elsewhen (stage2_pte_cache_hit) {
+      when (stage2_pte_cache_hit) {
         aux_count := aux_count + 1.U
         aux_pte.ppn := stage2_pte_cache_data
         aux_pte.reserved_for_future := 0.U

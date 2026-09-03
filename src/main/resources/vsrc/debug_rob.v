@@ -39,7 +39,7 @@ module DebugROBPushTrace (
                           input		trace_valid,
                           input [63:0]	trace_iaddr,
                           input [63:0]	trace_insn,
-                          input [2:0]	trace_priv,
+                          input [3:0]	trace_priv,
                           input		trace_exception,
                           input		trace_interrupt,
                           input [63:0]	trace_cause,
@@ -91,7 +91,7 @@ module DebugROBPopTrace (
                          output		trace_valid,
                          output [63:0]	trace_iaddr,
                          output [63:0]	trace_insn,
-                         output [2:0]	trace_priv,
+                         output [3:0]	trace_priv,
                          output		trace_exception,
                          output		trace_interrupt,
                          output [63:0]	trace_cause,
@@ -113,7 +113,7 @@ module DebugROBPopTrace (
    reg					__trace_valid_reg;
    reg [63:0]				__trace_iaddr_reg;
    reg [63:0]				__trace_insn_reg;
-   reg [2:0]				__trace_priv_reg;
+   reg [3:0]				__trace_priv_reg;
    reg					__trace_exception_reg;
    reg					__trace_interrupt_reg;
    reg [63:0]				__trace_cause_reg;
@@ -153,4 +153,3 @@ module DebugROBPopTrace (
       end
    end
 endmodule; // DebugROBPopTrace
-
