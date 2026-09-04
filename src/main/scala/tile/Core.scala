@@ -58,6 +58,7 @@ trait CoreParams {
   def traceCustom: Option[Data] = None
   def customIsaExt: Option[String] = None
   def customCSRs(implicit p: Parameters): CustomCSRs = new CustomCSRs
+  def hasNACC: Boolean = false
 
   def hasSupervisorMode: Boolean = useSupervisor || useVM
   def instBytes: Int = instBits / 8

@@ -15,7 +15,7 @@ class WidenedTracedInstruction extends Bundle {
   val valid = Bool()
   val iaddr = UInt(64.W)
   val insn = UInt(64.W)
-  val priv = UInt(3.W)
+  val priv = UInt(4.W)
   val exception = Bool()
   val interrupt = Bool()
   val cause = UInt(64.W)

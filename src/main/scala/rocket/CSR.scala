@@ -224,7 +224,8 @@ class TracedInstruction(implicit p: Parameters) extends CoreBundle {
   val valid = Bool()
   val iaddr = UInt(coreMaxAddrBits.W)
   val insn = UInt(iLen.W)
-  val priv = UInt(3.W)
+  // bit 3 是 hidden A，仅供硬件 trace/cosim 比对，不构成软件可见状态。
+  val priv = UInt(4.W)
   val exception = Bool()
   val interrupt = Bool()
   val cause = UInt(xLen.W)
@@ -263,6 +264,7 @@ class CSRFileIO(hasBeu: Boolean)(implicit p: Parameters) extends CoreBundle
   val rw = new Bundle {
     val addr = Input(UInt(CSR.ADDRSZ.W))
     val cmd = Input(Bits(CSR.SZ.W))
+    val inst = coreParams.hasNACC.option(Input(UInt(iLen.W)))
     val rdata = Output(Bits(xLen.W))
     val wdata = Input(Bits(xLen.W))
   }
@@ -275,6 +277,7 @@ class CSRFileIO(hasBeu: Boolean)(implicit p: Parameters) extends CoreBundle
   val trap_return = Output(Bool())
   val singleStep = Output(Bool())
   val status = Output(new MStatus())
+  val naccA = Output(Bool())
   val hstatus = Output(new HStatus())
   val gstatus = Output(new MStatus())
   val ptbr = Output(new PTBR())
@@ -394,6 +397,13 @@ class CSRFile(
   reset_mstatus.prv := PRV.M.U
   reset_mstatus.xs := (if (usingRoCC) 3.U else 0.U)
   val reg_mstatus = RegInit(reset_mstatus)
+
+  // hidden `A` 不是 CSR 字段，只由 trap/xRET 自动维护。A-side CSR storage 在
+  // custom CSR 声明生成后接到这些 Wire，供较早的 interrupt 仲裁逻辑使用。
+  val reg_nacc_a = RegInit(false.B)
+  val naccASIE = WireDefault(false.B)
+  val naccAIDeleg = WireDefault(0.U(xLen.W))
+  val naccASIESources = WireDefault(0.U(xLen.W))
 
   val new_prv = WireDefault(reg_mstatus.prv)
   reg_mstatus.prv := legalizePrivilege(new_prv)
@@ -618,10 +628,14 @@ class CSRFile(
     (((nmi.rnmi && reg_rnmie) << CSR.rnmiIntCause) |
     io.interrupts.buserror.map(_ << CSR.rnmiBEUCause).getOrElse(0.U),
     !io.interrupts.debug && nmi.rnmi && reg_rnmie)).getOrElse(0.U, false.B)
-  val m_interrupts = Mux(nmie && (reg_mstatus.prv <= PRV.S.U || reg_mstatus.mie), ~(~pending_interrupts | read_mideleg), 0.U)
-  val s_interrupts = Mux(nmie && (reg_mstatus.v || reg_mstatus.prv < PRV.S.U || (reg_mstatus.prv === PRV.S.U && reg_mstatus.sie)), pending_interrupts & read_mideleg & ~read_hideleg, 0.U)
+  val nacc_mideleg = Mux(reg_nacc_a, naccAIDeleg, read_mideleg)
+  val m_interrupts = Mux(nmie && (reg_mstatus.prv <= PRV.S.U || reg_mstatus.mie), ~(~pending_interrupts | nacc_mideleg), 0.U)
+  val s_interrupts = Mux(!reg_nacc_a && nmie && (reg_mstatus.v || reg_mstatus.prv < PRV.S.U || (reg_mstatus.prv === PRV.S.U && reg_mstatus.sie)), pending_interrupts & read_mideleg & ~read_hideleg, 0.U)
+  val as_interrupts = Mux(reg_nacc_a && nmie &&
+    (reg_mstatus.prv < PRV.S.U || (reg_mstatus.prv === PRV.S.U && naccASIE)),
+    read_mip & naccAIDeleg & naccASIESources, 0.U)
   val vs_interrupts = Mux(nmie && (reg_mstatus.v && (reg_mstatus.prv < PRV.S.U || reg_mstatus.prv === PRV.S.U && reg_vsstatus.sie)), pending_interrupts & read_hideleg, 0.U)
-  val (anyInterrupt, whichInterrupt) = chooseInterrupt(Seq(vs_interrupts, s_interrupts, m_interrupts, nmi_interrupts, d_interrupts))
+  val (anyInterrupt, whichInterrupt) = chooseInterrupt(Seq(vs_interrupts, s_interrupts, as_interrupts, m_interrupts, nmi_interrupts, d_interrupts))
   val interruptMSB = BigInt(1) << (xLen-1)
   val interruptCause = interruptMSB.U + (nmiFlag << (xLen-2)) + whichInterrupt
   io.interrupt := (anyInterrupt && !io.singleStep || reg_singleStepped) && !(reg_debug || io.status.cease)
@@ -806,6 +820,73 @@ class CSRFile(
   val reg_custom = customCSRs.zip(io.customCSRs).map(t => generateCustomCSR(t._1, t._2))
   val reg_rocc = roccCSRs.zip(io.roccCSRs).map(t => generateCustomCSR(t._1, t._2))
 
+  // Reuse storage generated above from BoomCustomCSRs declarations; do not create another CSR or Reg.
+  def existingCustomCSRValue(id: Int): UInt = {
+    val matches = customCSRs.zipWithIndex.filter(_._1.id == id)
+    require(matches.size == 1, f"NACC requires exactly one custom CSR at 0x$id%03x")
+    reg_custom(matches.head._2)
+  }
+
+  // NACC A-mode 特权级模型。字段布局与掩码定义见 NACC.scala。hidden `A` 在前面
+  // 单独声明，不属于这里生成的任何 CSR storage。
+  val asStatus = if (coreParams.hasNACC) {
+    existingCustomCSRValue(NACCCSRs.asstatus)
+  } else {
+    0.U(xLen.W)
+  }
+  val asEpc = if (coreParams.hasNACC) {
+    existingCustomCSRValue(NACCCSRs.asepc)
+  } else {
+    0.U(xLen.W)
+  }
+  val asTvec = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.astvec) else 0.U(xLen.W)
+  val asCause = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.ascause) else 0.U(xLen.W)
+  val asTval = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.astval) else 0.U(xLen.W)
+  val asIEStorage = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.asie) else 0.U(xLen.W)
+  val aeDeleg = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.aedeleg) else 0.U(xLen.W)
+  val aiDeleg = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.aideleg) else 0.U(xLen.W)
+
+  val read_aedeleg = aeDeleg & hs_delegable_exceptions
+  val read_aideleg = aiDeleg & delegable_interrupts
+  naccAIDeleg := read_aideleg
+  naccASIESources := asIEStorage & read_aideleg
+  naccASIE := asStatus(NACCStatus.ASIE)
+
+  if (coreParams.hasNACC) {
+    require(xLen > NACCStatus.InternalDataA, "NACC requires an XLEN wide enough for internal A-world signals")
+    require(!usingHypervisor, "NACC and the hypervisor extension are mutually exclusive")
+  }
+
+  // 当前 mode 对 asstatus 的字段掩码；hidden `A` 没有软件可见镜像。
+  val asStatusReadMask = if (coreParams.hasNACC) {
+    Mux(reg_mstatus.prv === PRV.M.U, NACCStatus.ReadMaskM.U(xLen.W),
+      Mux(reg_nacc_a, NACCStatus.ReadMaskAS.U(xLen.W), NACCStatus.ReadMaskS.U(xLen.W)))
+  } else {
+    0.U(xLen.W)
+  }
+  val asStatusWriteMask = if (coreParams.hasNACC) {
+    Mux(reg_mstatus.prv === PRV.M.U, NACCStatus.WriteMaskM.U(xLen.W),
+      Mux(reg_nacc_a, NACCStatus.WriteMaskAS.U(xLen.W), NACCStatus.WriteMaskS.U(xLen.W)))
+  } else {
+    0.U(xLen.W)
+  }
+  // 对外可见的 asstatus 只包含当前 mode 有权观察的 stored fields。
+  val asStatusVisible = if (coreParams.hasNACC) {
+    asStatus & asStatusReadMask
+  } else {
+    0.U(xLen.W)
+  }
+
+  if (coreParams.hasNACC) {
+    read_mapping(NACCCSRs.asstatus) = asStatusVisible
+    read_mapping(NACCCSRs.astvec) = formTVec(asTvec).sextTo(xLen)
+    read_mapping(NACCCSRs.asepc) = readEPC(asEpc).sextTo(xLen)
+    read_mapping(NACCCSRs.asip) = read_mip & read_aideleg
+    read_mapping(NACCCSRs.asie) = asIEStorage & read_aideleg
+    read_mapping(NACCCSRs.aedeleg) = read_aedeleg
+    read_mapping(NACCCSRs.aideleg) = read_aideleg
+  }
+
   if (usingHypervisor) {
     read_mapping += CSRs.mtinst -> read_mtinst
     read_mapping += CSRs.mtval2 -> reg_mtval2
@@ -885,14 +966,17 @@ class CSRFile(
     usingNMI.option(             MNRET->       List(N,N,Y,N,N,N,N,N,N)) ++
     coreParams.haveCFlush.option(CFLUSH_D_L1-> List(N,N,N,N,N,N,N,N,N)) ++
     usingSupervisor.option(      SRET->        List(N,N,Y,N,N,N,N,N,N)) ++
+    coreParams.hasNACC.option(   ASRET->       List(N,N,Y,N,N,N,N,N,N)) ++
     usingVM.option(              SFENCE_VMA->  List(N,N,N,N,N,Y,N,N,N)) ++
     usingHypervisor.option(      HFENCE_VVMA-> List(N,N,N,N,N,N,Y,N,N)) ++
     usingHypervisor.option(      HFENCE_GVMA-> List(N,N,N,N,N,N,N,Y,N)) ++
     (if (usingHypervisor)        hlsv.map(_->  List(N,N,N,N,N,N,N,N,Y)) else Seq())
-  val insn_call :: insn_break :: insn_ret :: insn_cease :: insn_wfi :: _ :: _ :: _ :: _ :: Nil = {
-    val insn = ECALL.value.U | (io.rw.addr << 20)
+  val decoded_system_insn = {
+    val insn = io.rw.inst.getOrElse(ECALL.value.U | (io.rw.addr << 20))
     DecodeLogic(insn, decode_table(0)._2.map(x=>X), decode_table).map(system_insn && _.asBool)
   }
+  val insn_call :: insn_break :: insn_ret :: insn_cease :: insn_wfi :: _ :: _ :: _ :: _ :: Nil = decoded_system_insn
+  val insn_asret = system_insn && io.rw.inst.map(_ === ASRET.value.U).getOrElse(false.B)
 
   for (io_dec <- io.decode) {
     val addr = io_dec.inst(31, 20)
@@ -900,8 +984,9 @@ class CSRFile(
     def decodeAny(m: LinkedHashMap[Int,Bits]): Bool = m.map { case(k: Int, _: Bits) => addr === k.U }.reduce(_||_)
     def decodeFast(s: Seq[Int]): Bool = DecodeLogic(addr, s.map(_.U), (read_mapping.toMap -- s).keys.toList.map(_.U))
 
-    val _ :: is_break :: is_ret :: _ :: is_wfi :: is_sfence :: is_hfence_vvma :: is_hfence_gvma :: is_hlsv :: Nil =
-      DecodeLogic(io_dec.inst, decode_table(0)._2.map(x=>X), decode_table).map(_.asBool)
+    val decoded_system = DecodeLogic(io_dec.inst, decode_table(0)._2.map(x=>X), decode_table).map(_.asBool)
+    val _ :: is_break :: is_ret :: _ :: is_wfi :: is_sfence :: is_hfence_vvma :: is_hfence_gvma :: is_hlsv :: Nil = decoded_system
+    val is_asret = io_dec.inst === ASRET.value.U
     val is_counter = (addr.inRange(CSR.firstCtr.U, (CSR.firstCtr + CSR.nCtr).U) || addr.inRange(CSR.firstCtrH.U, (CSR.firstCtrH + CSR.nCtr).U))
 
     val allow_wfi = (!usingSupervisor).B || reg_mstatus.prv > PRV.S.U || !reg_mstatus.tw && (!reg_mstatus.v || !reg_hstatus.vtw)
@@ -918,24 +1003,46 @@ class CSRFile(
     io_dec.fp_csr := decodeFast(fp_csrs.keys.toList)
     io_dec.vector_csr := decodeFast(vector_csrs.keys.toList)
     io_dec.rocc_illegal := io.status.xs === 0.U || reg_mstatus.v && reg_vsstatus.xs === 0.U || !reg_misa('x'-'a')
-    val csr_addr_legal = reg_mstatus.prv >= CSR.mode(addr) ||
+    val naccAsstatusAccess = coreParams.hasNACC.B && addr === NACCCSRs.asstatus.U &&
+      reg_mstatus.prv === PRV.S.U
+    val csr_addr_legal = reg_mstatus.prv >= CSR.mode(addr) || naccAsstatusAccess ||
       usingHypervisor.B && !reg_mstatus.v && reg_mstatus.prv === PRV.S.U && CSR.mode(addr) === PRV.H.U
     val csr_exists = decodeAny(read_mapping)
+
+    /** A 世界的 trap/interrupt CSR 只有 AS 或 M 可访问。
+      *
+      * 光靠地址位判不出来：这几个编号落在 0x5c0–0x5c4，地址 bit[9:8] 自称 supervisor，
+      * 而 AS 与 Linux **特权级相同**（都是 S），唯一的区别是 A 位。所以标准的
+      * `prv >= CSR.mode(addr)` 对 Linux 恒成立，必须另加这一项。
+      *
+      * AU 不需要单独处理：它是 U-mode，`prv >= CSR.mode(addr)` 已经把它挡在外面，
+      * 需要这些值时由 AS 转告。
+      */
+    val naccATrapCSRDenied = if (coreParams.hasNACC) {
+      val isATrapCSR = NACCCSRs.aTrapCSRs.map(id => addr === id.U).reduce(_ || _)
+      isATrapCSR && !reg_nacc_a && reg_mstatus.prv =/= PRV.M.U
+    } else {
+      false.B
+    }
+
     io_dec.read_illegal := !csr_addr_legal ||
+      naccATrapCSRDenied ||
       !csr_exists ||
       ((addr === CSRs.satp.U || addr === CSRs.hgatp.U) && !allow_sfence_vma) ||
       is_counter && !allow_counter ||
       decodeFast(debug_csrs.keys.toList) && !reg_debug ||
       decodeFast(vector_csrs.keys.toList) && io_dec.vector_illegal ||
       io_dec.fp_csr && io_dec.fp_illegal
-    io_dec.write_illegal := addr(11,10).andR
+    io_dec.write_illegal := addr(11,10).andR || naccATrapCSRDenied
     io_dec.write_flush := {
       val addr_m = addr | (PRV.M.U << CSR.modeLSB)
       !(addr_m >= CSRs.mscratch.U && addr_m <= CSRs.mtval.U)
     }
-    io_dec.system_illegal := !csr_addr_legal && !is_hlsv ||
+    io_dec.system_illegal := !csr_addr_legal && !is_hlsv && !is_asret ||
       is_wfi && !allow_wfi ||
-      is_ret && !allow_sret ||
+      is_ret && !is_asret && !allow_sret ||
+      is_ret && !is_asret && coreParams.hasNACC.B && reg_nacc_a ||
+      is_asret && (!coreParams.hasNACC.B || !reg_nacc_a || reg_mstatus.prv =/= PRV.S.U) ||
       is_ret && addr(10) && addr(7) && !reg_debug ||
       (is_sfence || is_hfence_gvma) && !allow_sfence_vma ||
       is_hfence_vvma && !allow_hfence_vvma ||
@@ -956,9 +1063,11 @@ class CSRFile(
       is_sfence && (!reg_mstatus.prv(0) || reg_hstatus.vtvm))
   }
 
+  val naccASEcall = coreParams.hasNACC.B && insn_call && reg_nacc_a && reg_mstatus.prv === PRV.S.U
   val cause =
+    Mux(naccASEcall, NACCCauses.AS_ECALL.U,
     Mux(insn_call, Causes.user_ecall.U + Mux(reg_mstatus.prv(0) && reg_mstatus.v, PRV.H.U, reg_mstatus.prv),
-    Mux[UInt](insn_break, Causes.breakpoint.U, io.cause))
+    Mux[UInt](insn_break, Causes.breakpoint.U, io.cause)))
   val cause_lsbs = cause(log2Ceil(1 + CSR.busErrorIntCause)-1, 0)
   val cause_deleg_lsbs = cause(log2Ceil(xLen)-1,0)
   val causeIsDebugInt = cause(xLen-1) && cause_lsbs === CSR.debugIntCause.U
@@ -968,7 +1077,10 @@ class CSRFile(
   val debugEntry = p(DebugModuleKey).map(_.debugEntry).getOrElse(BigInt(0x800))
   val debugException = p(DebugModuleKey).map(_.debugException).getOrElse(BigInt(0x808))
   val debugTVec = Mux(reg_debug, Mux(insn_break, debugEntry.U, debugException.U), debugEntry.U)
-  val delegate = usingSupervisor.B && reg_mstatus.prv <= PRV.S.U && Mux(cause(xLen-1), read_mideleg(cause_deleg_lsbs), read_medeleg(cause_deleg_lsbs))
+  val delegateA = coreParams.hasNACC.B && reg_nacc_a && !naccASEcall &&
+    Mux(cause(xLen-1), read_aideleg(cause_deleg_lsbs), read_aedeleg(cause_deleg_lsbs))
+  val delegate = usingSupervisor.B && reg_mstatus.prv <= PRV.S.U &&
+    (naccASEcall || (!reg_nacc_a && Mux(cause(xLen-1), read_mideleg(cause_deleg_lsbs), read_medeleg(cause_deleg_lsbs))))
   val delegateVS = reg_mstatus.v && delegate && Mux(cause(xLen-1), read_hideleg(cause_deleg_lsbs), read_hedeleg(cause_deleg_lsbs))
   def mtvecBaseAlign = 2
   def mtvecInterruptAlign = {
@@ -976,7 +1088,8 @@ class CSRFile(
     log2Ceil(xLen)
   }
   val notDebugTVec = {
-    val base = Mux(delegate, Mux(delegateVS, read_vstvec, read_stvec), read_mtvec)
+    val base = Mux(delegateA, formTVec(asTvec).sextTo(xLen),
+      Mux(delegate, Mux(delegateVS, read_vstvec, read_stvec), read_mtvec))
     val interruptOffset = cause(mtvecInterruptAlign-1, 0) << mtvecBaseAlign
     val interruptVec = Cat(base >> (mtvecInterruptAlign + mtvecBaseAlign), interruptOffset)
     val doVector = base(0) && cause(cause.getWidth-1) && (cause_lsbs >> mtvecInterruptAlign) === 0.U
@@ -994,7 +1107,6 @@ class CSRFile(
   val nmiTVec = (Mux(causeIsNmi, nmiTVecInt, nmiTVecXcpt)>>1)<<1
 
   val tvec = Mux(trapToDebug, debugTVec, Mux(trapToNmi, nmiTVec, notDebugTVec))
-  io.evec := tvec
   io.ptbr := reg_satp
   io.hgatp := reg_hgatp
   io.vsatp := reg_vsatp
@@ -1002,6 +1114,7 @@ class CSRFile(
   io.trap_return := insn_ret
   io.singleStep := reg_dcsr.step && !reg_debug
   io.status := reg_mstatus
+  io.naccA := reg_nacc_a
   io.status.sd := io.status.fs.andR || io.status.xs.andR || io.status.vs.andR
   io.status.debug := reg_debug
   io.status.isa := reg_misa
@@ -1020,10 +1133,11 @@ class CSRFile(
   io.gstatus.sd_rv32 := (xLen == 32).B && io.gstatus.sd
 
   val exception = insn_call || insn_break || io.exception
-  assert(PopCount(insn_ret :: insn_call :: insn_break :: io.exception :: Nil) <= 1.U, "these conditions must be mutually exclusive")
+  assert(PopCount(insn_ret :: insn_call :: insn_break :: io.exception :: Nil) <= 1.U,
+    "these conditions must be mutually exclusive")
 
   when (insn_wfi && !io.singleStep && !reg_debug) { reg_wfi := true.B }
-  when (pending_interrupts.orR || io.interrupts.debug || exception) { reg_wfi := false.B }
+  when (anyInterrupt || io.interrupts.debug || exception) { reg_wfi := false.B }
   io.interrupts.nmi.map(nmi => when (nmi.rnmi) { reg_wfi := false.B } )
 
   when (io.retire(0) || exception) { reg_singleStepped := true.B }
@@ -1033,6 +1147,8 @@ class CSRFile(
 
   val epc = formEPC(io.pc)
   val tval = Mux(insn_break, epc, io.tval)
+
+  io.evec := tvec
 
   when (exception) {
     when (trapToDebug) {
@@ -1054,6 +1170,18 @@ class CSRFile(
         reg_mncause := (BigInt(1) << (xLen-1)).U | Mux(causeIsRnmiBEU, 3.U, 2.U)
         reg_mnstatus.mpp := trimPrivilege(reg_mstatus.prv)
         new_prv := PRV.M.U
+      }
+    }.elsewhen (delegateA && nmie) {
+      if (coreParams.hasNACC) {
+        asEpc := epc
+        asCause := cause
+        asTval := tval
+        asStatus := (asStatus & ~NACCStatus.ATrapMask.U(xLen.W)) |
+          (BigInt(1) << NACCStatus.ASPA).U(xLen.W) |
+          Mux(reg_mstatus.prv === PRV.S.U, (BigInt(1) << NACCStatus.ASPP).U(xLen.W), 0.U(xLen.W)) |
+          Mux(asStatus(NACCStatus.ASIE), (BigInt(1) << NACCStatus.ASPIE).U(xLen.W), 0.U(xLen.W))
+        reg_nacc_a := true.B
+        new_prv := PRV.S.U
       }
     }.elsewhen (delegateVS && nmie) {
       reg_mstatus.v := true.B
@@ -1078,6 +1206,16 @@ class CSRFile(
       reg_mstatus.spp := reg_mstatus.prv
       reg_mstatus.sie := false.B
       new_prv := PRV.S.U
+      if (coreParams.hasNACC) {
+        // trap 进 S 每次覆盖 SPA：AS ECALL 的来源 world 为 A，普通 S-side trap 的来源 world 为非 A。
+        asStatus := Mux(naccASEcall,
+          asStatus | (BigInt(1) << NACCStatus.SPA).U(xLen.W),
+          asStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W))
+        when (naccASEcall) {
+          reg_stval := 0.U
+          reg_nacc_a := false.B
+        }
+      }
     }.otherwise {
       reg_mstatus.v := false.B
       reg_mstatus.mpv := reg_mstatus.v
@@ -1091,6 +1229,13 @@ class CSRFile(
       reg_mstatus.mpp := trimPrivilege(reg_mstatus.prv)
       reg_mstatus.mie := false.B
       new_prv := PRV.M.U
+      if (coreParams.hasNACC) {
+        // trap 进 M：MPA 记录来源 world；A-side EPC/cause/tval 保持不变。
+        asStatus := Mux(reg_nacc_a,
+          asStatus | (BigInt(1) << NACCStatus.MPA).U(xLen.W),
+          asStatus & ~(BigInt(1) << NACCStatus.MPA).U(xLen.W))
+        reg_nacc_a := false.B
+      }
     }
   }
 
@@ -1116,7 +1261,16 @@ class CSRFile(
 
   when (insn_ret) {
     val ret_prv = WireInit(UInt(), DontCare)
-    when (usingSupervisor.B && !io.rw.addr(9)) {
+    when (insn_asret) {
+      if (coreParams.hasNACC) {
+        ret_prv := Mux(asStatus(NACCStatus.ASPP), PRV.S.U(PRV.SZ.W), PRV.U.U(PRV.SZ.W))
+        reg_nacc_a := asStatus(NACCStatus.ASPA)
+        io.evec := readEPC(asEpc)
+        asStatus := (asStatus & ~NACCStatus.ATrapMask.U(xLen.W)) |
+          Mux(asStatus(NACCStatus.ASPIE), (BigInt(1) << NACCStatus.ASIE).U(xLen.W), 0.U(xLen.W)) |
+          (BigInt(1) << NACCStatus.ASPIE).U(xLen.W)
+      }
+    }.elsewhen (usingSupervisor.B && !io.rw.addr(9)) {
       when (!reg_mstatus.v) {
         reg_mstatus.sie := reg_mstatus.spie
         reg_mstatus.spie := true.B
@@ -1125,6 +1279,10 @@ class CSRFile(
         reg_mstatus.v := usingHypervisor.B && reg_hstatus.spv
         io.evec := readEPC(reg_sepc)
         reg_hstatus.spv := false.B
+        if (coreParams.hasNACC) {
+          reg_nacc_a := asStatus(NACCStatus.SPA)
+          asStatus := asStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W)
+        }
       }.otherwise {
         reg_vsstatus.sie := reg_vsstatus.spie
         reg_vsstatus.spie := true.B
@@ -1151,6 +1309,10 @@ class CSRFile(
       ret_prv := reg_mstatus.mpp
       reg_mstatus.v := usingHypervisor.B && reg_mstatus.mpv && reg_mstatus.mpp <= PRV.S.U
       io.evec := readEPC(reg_mepc)
+      if (coreParams.hasNACC) {
+        reg_nacc_a := asStatus(NACCStatus.MPA) && reg_mstatus.mpp =/= PRV.M.U
+        asStatus := asStatus & ~(BigInt(1) << NACCStatus.MPA).U(xLen.W)
+      }
     }
 
     new_prv := ret_prv
@@ -1164,10 +1326,19 @@ class CSRFile(
   io.status.cease := RegEnable(true.B, false.B, insn_cease)
   io.status.wfi := reg_wfi
 
-  for ((io, reg) <- io.customCSRs zip reg_custom) {
+  for (((io, reg), decl) <- io.customCSRs zip reg_custom zip customCSRs) {
     io.wen := false.B
     io.wdata := wdata
-    io.value := reg
+    // hidden `A` 只通过内部 bundle 送往 TLB/PTW；软件 read_mapping 不含这些位。
+    if (coreParams.hasNACC && decl.id == NACCCSRs.asstatus) {
+      val dataA = Mux(reg_mstatus.prv === PRV.M.U && reg_mstatus.mprv && reg_mstatus.mpp =/= PRV.M.U,
+        asStatus(NACCStatus.MPA), reg_nacc_a)
+      io.value := reg |
+        Mux(reg_nacc_a, (BigInt(1) << NACCStatus.InternalCurrentA).U(xLen.W), 0.U(xLen.W)) |
+        Mux(dataA, (BigInt(1) << NACCStatus.InternalDataA).U(xLen.W), 0.U(xLen.W))
+    } else {
+      io.value := reg
+    }
   }
 
   for ((io, reg) <- io.roccCSRs zip reg_rocc) {
@@ -1503,9 +1674,25 @@ class CSRFile(
       }
     }
     def writeCustomCSR(io: CustomCSRIO, csr: CustomCSR, reg: UInt) = {
-      val mask = csr.mask.U(xLen.W)
+      val mask = if (coreParams.hasNACC && csr.id == NACCCSRs.asstatus) {
+        asStatusWriteMask
+      } else if (coreParams.hasNACC && csr.id == NACCCSRs.aedeleg) {
+        hs_delegable_exceptions
+      } else if (coreParams.hasNACC && csr.id == NACCCSRs.aideleg) {
+        delegable_interrupts
+      } else if (coreParams.hasNACC && csr.id == NACCCSRs.asie) {
+        read_aideleg
+      } else if (coreParams.hasNACC && csr.id == NACCCSRs.asip) {
+        0.U(xLen.W)
+      } else {
+        csr.mask.U(xLen.W)
+      }
       when (decoded_addr(csr.id)) {
-        reg := (wdata & mask) | (reg & ~mask)
+        if (coreParams.hasNACC && csr.id == NACCCSRs.asepc) {
+          reg := formEPC(wdata)
+        } else {
+          reg := (wdata & mask) | (reg & ~mask)
+        }
         io.wen := true.B
       }
     }
@@ -1514,6 +1701,12 @@ class CSRFile(
     }
     for ((io, csr, reg) <- io.roccCSRs.lazyZip(roccCSRs).lazyZip(reg_rocc)) {
       writeCustomCSR(io, csr, reg)
+    }
+    if (coreParams.hasNACC) {
+      when (decoded_addr(NACCCSRs.asip)) {
+        val new_asip = ((read_mip & ~read_aideleg) | (wdata & read_aideleg)).asTypeOf(new MIP())
+        reg_mip.ssip := new_asip.ssip
+      }
     }
     if (usingVector) {
       when (decoded_addr(CSRs.vstart)) { set_vs_dirty := true.B; reg_vstart.get := wdata }
@@ -1623,7 +1816,7 @@ class CSRFile(
     t.valid := io.retire > i.U || t.exception
     t.insn := insn
     t.iaddr := io.pc
-    t.priv := Cat(reg_debug, reg_mstatus.prv)
+    t.priv := Cat(reg_nacc_a, reg_debug, reg_mstatus.prv)
     t.cause := cause
     t.interrupt := cause(xLen-1)
     t.tval := io.tval
@@ -1666,6 +1859,13 @@ class CSRFile(
   def formEPC(x: UInt) = ~(~x | (if (usingCompressed) 1.U else 3.U))
   def readEPC(x: UInt) = ~(~x | Mux(reg_misa('c' - 'a'), 1.U, 3.U))
   def formTVec(x: UInt) = x andNot Mux(x(0), ((((BigInt(1) << mtvecInterruptAlign) - 1) << mtvecBaseAlign) | 2).U, 2.U)
+  def encodeVirtualAddress(a0: UInt, ea: UInt) = if (vaddrBitsExtended == vaddrBits) ea else {
+    // Compress an XLEN virtual address while preserving the non-canonical marker.
+    val b = vaddrBitsExtended - 1
+    val a = (a0 >> b).asSInt
+    val msb = Mux(a === 0.S || a === -1.S, ea(b), !ea(b - 1))
+    Cat(msb, ea(b - 1, 0))
+  }
   def isaStringToMask(s: String) = s.map(x => 1 << (x - 'A')).foldLeft(0)(_|_)
   def formFS(fs: UInt) = if (coreParams.haveFSDirty) fs else Fill(2, fs.orR)
   def formVS(vs: UInt) = if (usingVector) vs else 0.U

@@ -45,6 +45,15 @@ class CustomCSRs(implicit p: Parameters) extends CoreBundle {
   def disableCoreClockGate = getOrElse(chickenCSR, _.value(2), false.B)
   def disableSpeculativeICacheRefill = getOrElse(chickenCSR, _.value(3), false.B)
   def suppressCorruptOnGrantData = getOrElse(chickenCSR, _.value(9), false.B)
+  // NACC A-mode。软件读取 `asstatus` 时看不到 hidden `A`；CSRFile 只在这条
+  // 内部 bundle 上附加 current/effective world，供 TLB/PTW 做权限判定。
+  def asStatusValue = 0.U(xLen.W)
+  def asEpcValue = 0.U(xLen.W)
+  def naccSagentValue = 0.U(xLen.W)
+  def naccEagentValue = 0.U(xLen.W)
+  def naccBitmapStorageBaseValue = 0.U(xLen.W)
+  def naccBitmapTargetStartValue = 0.U(xLen.W)
+  def naccBitmapTargetEndValue = 0.U(xLen.W)
 
   protected def getByIdOrElse[T](id: Int, f: CustomCSRIO => T, alt: T): T = {
     val idx = decls.indexWhere(_.id == id)
