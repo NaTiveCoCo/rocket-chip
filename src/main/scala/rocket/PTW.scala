@@ -416,7 +416,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     val superpageEnd = superpageStart + superpageSize
     val targetStart = io.dpath.customCSRs.naccBitmapTargetStartValue.padTo(addressWidth)
     val targetEnd = io.dpath.customCSRs.naccBitmapTargetEndValue.padTo(addressWidth)
-    finalPhysicalResultValid && count =/= (pgLevels-1).U &&
+    finalPhysicalResultValid && count =/= (pgLevels-1).U && targetStart < targetEnd &&
       superpageStart < targetEnd && superpageEnd > targetStart
   } else {
     false.B
@@ -513,7 +513,11 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     // replacement way
     r_l2_plru_way := (if (coreParams.nL2TLBWays > 1) l2_plru.way(r_idx) else 0.U)
     // refill with r_pte(leaf pte)
-    when (l2_refill && !invalidated && !naccBitmapFatal.getOrElse(false.B)) {
+    when (l2_refill && !invalidated && !io.dpath.sfence.valid && !naccBitmapFatal.getOrElse(false.B)) {
+      if (coreParams.hasNACC) {
+        assert(count === (pgLevels-1).U && !resp_fragmented_superpage,
+          "NACC L2 TLB must only refill original 4 KiB translations")
+      }
       val entry = Wire(new L2TLBEntry(nL2TLBSets))
       entry.ppn := r_pte.ppn
       entry.d := r_pte.d
@@ -721,14 +725,11 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       val pageSize = BigInt(1) << (pgIdxBits + ((pgLevels - 1 - i) * pgLevelBits))
       val pageStart = (r_pte.ppn << pgIdxBits).padTo(addressWidth)
       val pageEnd = pageStart + pageSize.U(addressWidth.W)
-      val agentStart = io.dpath.customCSRs.naccSagentValue.padTo(addressWidth)
-      val agentEnd = io.dpath.customCSRs.naccEagentValue.padTo(addressWidth)
       val targetStart = io.dpath.customCSRs.naccBitmapTargetStartValue.padTo(addressWidth)
       val targetEnd = io.dpath.customCSRs.naccBitmapTargetEndValue.padTo(addressWidth)
-      val insideAgentRegion = pageStart >= agentStart && pageEnd <= agentEnd
-      val outsideTargetRange = pageEnd <= targetStart || pageStart >= targetEnd
-      val insideTargetRange = pageStart >= targetStart && pageEnd <= targetEnd
-      insideAgentRegion || outsideTargetRange || insideTargetRange
+      val outsideTargetRange = targetStart >= targetEnd || pageEnd <= targetStart || pageStart >= targetEnd
+      // Even a fully covered superpage may contain different raw tags.
+      (i == pgLevels-1).B || outsideTargetRange
     }
   } else {
     Seq.fill(pgLevels)(true.B)
@@ -755,7 +756,17 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     io.requestor(i).resp.bits.naccRootValidationOnly.foreach(_ := r_req.naccRootValidationOnly.get)
     io.requestor(i).resp.bits.level := max_count
     io.requestor(i).resp.bits.homogeneous := homogeneous || pageGranularityPMPs.B
-    io.requestor(i).resp.bits.fragmented_superpage := resp_fragmented_superpage && pageGranularityPMPs.B
+    io.requestor(i).resp.bits.fragmented_superpage := resp_fragmented_superpage
+    if (coreParams.hasNACC) {
+      when (resp_valid(i) && resp_fragmented_superpage) {
+        assert(max_count === (pgLevels-1).U && !r_req.naccBitmapOnly.get,
+          "NACC fragmented response must cover exactly one 4 KiB translation")
+        when (inNACCBitmapTargetRange(r_pte.ppn << pgIdxBits)) {
+          assert(r_pte.ppn === r_naccBitmapPPN.get,
+            "NACC fragmented translation and raw tag must refer to the same PFN")
+        }
+      }
+    }
     io.requestor(i).resp.bits.gpa.valid := r_req.need_gpa
     io.requestor(i).resp.bits.gpa.bits :=
       Mux(
@@ -890,6 +901,14 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       when (!homogeneous) {
         count := (pgLevels-1).U
         resp_fragmented_superpage := true.B
+        if (coreParams.hasNACC) {
+          val subpagePPN = makeFragmentedSuperpagePPN(r_pte.ppn)(count)
+          when (inNACCBitmapTargetRange(subpagePPN << pgIdxBits)) {
+            r_naccBitmapPPN.get := subpagePPN
+            next_state := s_nacc_bitmap_req
+            resp_valid(r_req_dest) := false.B
+          }
+        }
       }
       when (do_both_stages) {
         resp_fragmented_superpage := true.B
@@ -992,7 +1011,8 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
         when (naccBitmapLookupRequired) {
           r_naccBitmapPPN.foreach(_ := pte.ppn(ppnBits-1, 0))
           next_state := s_nacc_bitmap_req
-        }.elsewhen (success && pageGranularityPMPs.B && !(count === (pgLevels-1).U && (!do_both_stages || aux_count === (pgLevels-1).U))) {
+        }.elsewhen (naccTargetSuperpage || (success && pageGranularityPMPs.B &&
+          !(count === (pgLevels-1).U && (!do_both_stages || aux_count === (pgLevels-1).U)))) {
           next_state := s_fragment_superpage
         }.otherwise {
           next_state := s_ready
@@ -1000,8 +1020,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
         }
 
         resp_ae_ptw := ae && ((count < (pgLevels-1).U && pte.table()) || (do_both_stages && !stage2_final))
-        resp_ae_final := (ae && pte.leaf() && !(do_both_stages && !stage2_final)) || naccTargetSuperpage
-        naccBitmapFatalEvent.foreach(_ := naccTargetSuperpage)
+        resp_ae_final := ae && pte.leaf() && !(do_both_stages && !stage2_final)
         resp_pf := pf && !stage2
         resp_gf := gf || (pf && stage2)
         resp_hr := !stage2 || (!pf && !gf && pte.ur())
@@ -1019,7 +1038,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       naccRootTagCachePPN.foreach(_ := r_naccBitmapPPN.get)
       naccRootTagCache.foreach(_ := shiftedTag(NACCBitmapTag.Width-1, 0))
     }
-    l2_refill := !r_req.naccBitmapOnly.getOrElse(false.B) && !naccBitmapFatal.getOrElse(false.B)
+    // Fragmented leaves have no parent-size metadata in L2; keep them in L1.
+    l2_refill := !r_req.naccBitmapOnly.getOrElse(false.B) && !resp_fragmented_superpage &&
+      !naccBitmapFatal.getOrElse(false.B)
     next_state := s_ready
     resp_valid(r_req_dest) := true.B
   }
