@@ -278,6 +278,7 @@ class CSRFileIO(hasBeu: Boolean)(implicit p: Parameters) extends CoreBundle
   val singleStep = Output(Bool())
   val status = Output(new MStatus())
   val naccA = Output(Bool())
+  val naccEntryFence = Output(Bool())
   val hstatus = Output(new HStatus())
   val gstatus = Output(new MStatus())
   val ptbr = Output(new PTBR())
@@ -401,6 +402,7 @@ class CSRFile(
   // hidden `A` 不是 CSR 字段，只由 trap/xRET 自动维护。A-side CSR storage 在
   // custom CSR 声明生成后接到这些 Wire，供较早的 interrupt 仲裁逻辑使用。
   val reg_nacc_a = RegInit(false.B)
+  io.naccEntryFence := false.B
   val naccASIE = WireDefault(false.B)
   val naccAIDeleg = WireDefault(0.U(xLen.W))
   val naccASIESources = WireDefault(0.U(xLen.W))
@@ -1042,6 +1044,8 @@ class CSRFile(
       is_wfi && !allow_wfi ||
       is_ret && !is_asret && !allow_sret ||
       is_ret && !is_asret && coreParams.hasNACC.B && reg_nacc_a ||
+      (coreParams.hasNACC.B && is_ret && addr === "h102".U && asStatus(NACCStatus.SPA) &&
+        (reg_mstatus.spp =/= PRV.S.U || reg_satp.mode =/= 8.U || (asTvec >> 2) === 0.U)) ||
       is_asret && (!coreParams.hasNACC.B || !reg_nacc_a || reg_mstatus.prv =/= PRV.S.U) ||
       is_ret && addr(10) && addr(7) && !reg_debug ||
       (is_sfence || is_hfence_gvma) && !allow_sfence_vma ||
@@ -1282,6 +1286,15 @@ class CSRFile(
         if (coreParams.hasNACC) {
           reg_nacc_a := asStatus(NACCStatus.SPA)
           asStatus := asStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W)
+          when (asStatus(NACCStatus.SPA)) {
+            // S may request entry, but only trusted astvec selects the first PC.
+            io.evec := (asTvec >> 2 << 2).asUInt
+            reg_mstatus.sie := false.B
+            asStatus := (asStatus & ~(NACCStatus.ATrapMask |
+              (BigInt(1) << NACCStatus.SPA)).U(xLen.W)) |
+              (BigInt(1) << NACCStatus.ASPP).U(xLen.W)
+            io.naccEntryFence := true.B
+          }
         }
       }.otherwise {
         reg_vsstatus.sie := reg_vsstatus.spie
