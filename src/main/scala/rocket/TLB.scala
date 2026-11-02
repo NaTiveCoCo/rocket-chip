@@ -740,7 +740,8 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   }
   val nacc_execute_array = if (coreParams.hasNACC && instruction) {
     // bit ordering与hits一致：ordinary最低，optional special其上，Bare/physical最高。
-    val physicalExecuteAllowed = !naccBareBitmapLookupRequired || naccBareTagExecuteAllowed
+    // A missing tag stalls through naccBareBitmapMiss; it is not an execute denial.
+    val physicalExecuteAllowed = !naccBareBitmapLookupRequired || !naccBareTagHit || naccBareTagExecuteAllowed
     Cat(physicalExecuteAllowed, entries.map(e => naccBitmapTagAllowsExecute(e.naccBitmapTag.get)).asUInt)
   } else {
     Fill(nPhysicalEntries + normal_entries.size, true.B)
