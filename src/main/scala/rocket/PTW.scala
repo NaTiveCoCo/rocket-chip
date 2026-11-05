@@ -23,6 +23,8 @@ import scala.collection.mutable.ListBuffer
 class PTWReq(implicit p: Parameters) extends CoreBundle()(p) {
   val addr = UInt(vpnBits.W)
   val need_gpa = Bool()
+  // Translation provenance, captured by the requester before arbitration.
+  val naccA = coreParams.hasNACC.option(Bool())
   val vstage1 = Bool()
   val stage2 = Bool()
   /** 跳过PTE walk，仅查询给定physical PFN的NACC bitmap raw tag */
@@ -183,6 +185,7 @@ class L2TLBEntry(nSets: Int)(implicit p: Parameters) extends CoreBundle()(p)
   val idxBits = log2Ceil(nSets)
   val tagBits = maxSVAddrBits - pgIdxBits - idxBits + (if (usingHypervisor) 1 else 0)
   val tag = UInt(tagBits.W)
+  val naccA = coreParams.hasNACC.option(Bool())
   val ppn = UInt(ppnBits.W)
   /** dirty bit */
   val d = Bool()
@@ -528,6 +531,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       entry.r := r_pte.r
       entry.naccBitmapTag.foreach(_ := r_naccBitmapTag.get)
       entry.tag := r_tag
+      entry.naccA.foreach(_ := r_req.naccA.get)
       // if all the way are valid, use plru to select one way to be replaced,
       // otherwise use PriorityEncoderOH to select one
       val wmask = if (coreParams.nL2TLBWays > 1) Mux(r_valid_vec_q.andR, UIntToOH(r_l2_plru_way, coreParams.nL2TLBWays), PriorityEncoderOH(~r_valid_vec_q)) else 1.U(1.W)
@@ -567,7 +571,8 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     when (s2_valid && s2_error) { valid.foreach { _ := 0.U }}
     // decode
     val s2_entry_vec = s2_rdata.map(_.uncorrected.asTypeOf(new L2TLBEntry(nL2TLBSets)))
-    val s2_hit_vec = (0 until coreParams.nL2TLBWays).map(way => s2_valid_vec(way) && (r_tag === s2_entry_vec(way).tag))
+    val s2_hit_vec = (0 until coreParams.nL2TLBWays).map(way => s2_valid_vec(way) && (r_tag === s2_entry_vec(way).tag) &&
+      s2_entry_vec(way).naccA.map(_ === r_req.naccA.get).getOrElse(true.B))
     val s2_hit = s2_valid && s2_hit_vec.orR
     io.dpath.perf.l2miss := s2_valid && !(s2_hit_vec.orR)
     io.dpath.perf.l2hit := s2_hit
@@ -851,9 +856,9 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
                 "NACC root validation must target the live satp root")
             }
           }
-          // PTW 请求采用 data effective world；这也覆盖 MPRV+MPP+MPA。
+          // Use the originating I/D request world, never live CSR state.
           when (arb.io.out.bits.valid && !naccBitmapOnly &&
-            io.dpath.customCSRs.asStatusValue(NACCStatus.InternalDataA)) {
+            arb.io.out.bits.bits.naccA.get) {
             assert(naccRootTagCacheValid.get && naccRootTagCachePPN.get === io.dpath.ptbr.ppn &&
               naccRootTagCache.get === NACCBitmapTag.RootL0.U,
               "NACC confidential walk reached PTW before validating a ROOT_L0 satp root")

@@ -12,7 +12,7 @@ import org.chipsalliance.diplomacy.lazymodule._
 
 import freechips.rocketchip.rocket.{
   MStatus, HellaCacheIO, TLBPTWIO, CanHavePTW, CanHavePTWModule,
-  SimpleHellaCacheIF, M_XRD, PTE, PRV, M_SZ
+  SimpleHellaCacheIF, M_XRD, PTE, PRV, M_SZ, NACCStatus
 }
 import freechips.rocketchip.tilelink.{
   TLNode, TLIdentityNode, TLClientNode, TLMasterParameters, TLMasterPortParameters
@@ -197,6 +197,7 @@ class TranslatorExampleModuleImp(outer: TranslatorExample)(implicit p: Parameter
   val req_rd = Reg(chiselTypeOf(io.resp.bits.rd))
   val req_offset = req_addr(pgIdxBits - 1, 0)
   val req_vpn = req_addr(coreMaxAddrBits - 1, pgIdxBits)
+  val req_a = if (coreParams.hasNACC) Some(Reg(Bool())) else None
   val pte = Reg(new PTE)
 
   val s_idle :: s_ptw_req :: s_ptw_resp :: s_resp :: Nil = Enum(4)
@@ -207,6 +208,7 @@ class TranslatorExampleModuleImp(outer: TranslatorExample)(implicit p: Parameter
   when (io.cmd.fire) {
     req_rd := io.cmd.bits.inst.rd
     req_addr := io.cmd.bits.rs1
+    req_a.foreach(_ := io.ptw(0).customCSRs.asStatusValue(NACCStatus.InternalDataA))
     state := s_ptw_req
   }
 
@@ -224,6 +226,7 @@ class TranslatorExampleModuleImp(outer: TranslatorExample)(implicit p: Parameter
   ptw.req.valid := (state === s_ptw_req)
   ptw.req.bits.valid := true.B
   ptw.req.bits.bits.addr := req_vpn
+  ptw.req.bits.bits.naccA.foreach(_ := req_a.get)
 
   io.resp.valid := (state === s_resp)
   io.resp.bits.rd := req_rd

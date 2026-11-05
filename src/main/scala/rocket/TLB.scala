@@ -160,6 +160,8 @@ class TLBEntry(val nSectors: Int, val superpage: Boolean, val superpageOnly: Boo
   val tag_vpn = UInt(vpnBits.W)
   /** tag in vitualization mode */
   val tag_v = Bool()
+  val naccA = coreParams.hasNACC.option(Bool())
+  def matchesA(a: Bool): Bool = naccA.map(_ === a).getOrElse(true.B)
   /** entry data */
   val data = Vec(nSectors, UInt(new TLBEntryData().getWidth.W))
   /** valid bit */
@@ -209,9 +211,13 @@ class TLBEntry(val nSectors: Int, val superpage: Boolean, val superpageOnly: Boo
     * find the target entry with vpn tag
     * and replace the target entry with the input entry data
     */
-  def insert(vpn: UInt, virtual: Bool, level: UInt, entry: TLBEntryData): Unit = {
+  def insert(vpn: UInt, virtual: Bool, level: UInt, entry: TLBEntryData, a: Bool = {
+    require(!coreParams.hasNACC, "NACC refill callers must supply captured A provenance")
+    false.B
+  }): Unit = {
     this.tag_vpn := vpn
     this.tag_v := virtual
+    naccA.foreach(_ := a)
     this.level := level.extract(log2Ceil(pgLevels - superpageOnly.toInt)-1, 0)
 
     val idx = sectorIdx(vpn)
@@ -355,6 +361,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val state = RegInit(s_ready)
   // use vpn as refill_tag
   val r_refill_tag = Reg(UInt(vpnBits.W))
+  val r_refill_a = coreParams.hasNACC.option(Reg(Bool()))
   val r_superpage_repl_addr = Reg(UInt(log2Ceil(superpage_entries.size).W))
   val r_sectored_repl_addr = Reg(UInt(log2Ceil(sectored_entries.head.size).W))
   val r_sectored_hit = Reg(Valid(UInt(log2Ceil(sectored_entries.head.size).W)))
@@ -610,9 +617,9 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val prot_eff = pma.io.resp.eff
 
   // hit check
-  val sector_hits = sectored_entries(memIdx).map(_.sectorHit(vpn, priv_v))
-  val superpage_hits = superpage_entries.map(_.hit(vpn, priv_v))
-  val hitsVec = all_entries.map(vm_enabled && _.hit(vpn, priv_v))
+  val sector_hits = sectored_entries(memIdx).map(e => e.matchesA(naccAgentMode) && e.sectorHit(vpn, priv_v))
+  val superpage_hits = superpage_entries.map(e => e.matchesA(naccAgentMode) && e.hit(vpn, priv_v))
+  val hitsVec = all_entries.map(e => vm_enabled && e.matchesA(naccAgentMode) && e.hit(vpn, priv_v))
   val real_hits = hitsVec.asUInt
   val hits = Cat(!vm_enabled, real_hits)
 
@@ -650,7 +657,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     // refill special_entry
     when (special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) {
       special_entry.foreach { e =>
-        e.insert(r_refill_tag, refill_v, io.ptw.resp.bits.level, newEntry)
+        e.insert(r_refill_tag, refill_v, io.ptw.resp.bits.level, newEntry, r_refill_a.getOrElse(false.B))
         if (coreParams.hasNACC) {
           when (invalidate_refill) { e.invalidate() }
         }
@@ -658,7 +665,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     }.elsewhen (io.ptw.resp.bits.level < (pgLevels-1).U) {
       val waddr = Mux(r_superpage_hit.valid && usingHypervisor.B, r_superpage_hit.bits, r_superpage_repl_addr)
       for ((e, i) <- superpage_entries.zipWithIndex) when (r_superpage_repl_addr === i.U) {
-        e.insert(r_refill_tag, refill_v, io.ptw.resp.bits.level, newEntry)
+        e.insert(r_refill_tag, refill_v, io.ptw.resp.bits.level, newEntry, r_refill_a.getOrElse(false.B))
         when (invalidate_refill) { e.invalidate() }
       }
     // refill sectored_hit
@@ -667,7 +674,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
       val waddr = Mux(r_sectored_hit.valid, r_sectored_hit.bits, r_sectored_repl_addr)
       for ((e, i) <- sectored_entries(r_memIdx).zipWithIndex) when (waddr === i.U) {
         when (!r_sectored_hit.valid) { e.invalidate() }
-        e.insert(r_refill_tag, refill_v, 0.U, newEntry)
+        e.insert(r_refill_tag, refill_v, 0.U, newEntry, r_refill_a.getOrElse(false.B))
         when (invalidate_refill) { e.invalidate() }
       }
     }
@@ -920,6 +927,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   io.ptw.req.valid := state === s_request && !naccPendingPTWBlocked
   io.ptw.req.bits.valid := !io.kill
   io.ptw.req.bits.bits.addr := r_refill_tag
+  io.ptw.req.bits.bits.naccA.foreach(_ := r_refill_a.get)
   io.ptw.req.bits.bits.vstage1 := r_vstage1_en
   io.ptw.req.bits.bits.stage2 := r_stage2_en
   io.ptw.req.bits.bits.need_gpa := r_need_gpa
@@ -960,6 +968,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     when (io.req.fire && (tlb_miss || naccBareBitmapMiss || naccRootValidationMiss)) {
       state := s_request
       r_refill_tag := vpn
+      r_refill_a.foreach(_ := naccAgentMode)
       val naccMetadataOnly = naccBareBitmapMiss || naccRootValidationMiss
       r_need_gpa := Mux(naccMetadataOnly, false.B, tlb_hit_if_not_gpa_miss)
       r_vstage1_en := Mux(naccMetadataOnly, false.B, vstage1_en)
