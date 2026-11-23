@@ -843,6 +843,7 @@ class CSRFile(
   val asCause = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.ascause) else 0.U(xLen.W)
   val asTval = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.astval) else 0.U(xLen.W)
   val asIEStorage = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.asie) else 0.U(xLen.W)
+  val asGrantConfig = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.asgrantcfg) else 0.U(xLen.W)
   val aeDeleg = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.aedeleg) else 0.U(xLen.W)
   val aiDeleg = if (coreParams.hasNACC) existingCustomCSRValue(NACCCSRs.aideleg) else 0.U(xLen.W)
 
@@ -1285,6 +1286,8 @@ class CSRFile(
           reg_nacc_a := asStatus(NACCStatus.SPA)
           asStatus := asStatus & ~(BigInt(1) << NACCStatus.SPA).U(xLen.W)
           when (asStatus(NACCStatus.SPA)) {
+            // Revoke before AS entry; retain the byte bounds for RTL/Spike parity.
+            asGrantConfig := 0.U
             // S may request entry, but only trusted astvec selects the first PC.
             io.evec := (asTvec >> 2 << 2).asUInt
             reg_mstatus.sie := false.B

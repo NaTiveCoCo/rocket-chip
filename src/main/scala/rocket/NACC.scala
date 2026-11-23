@@ -34,6 +34,13 @@ object NACCCSRs {
   val asip      = 0x5c5
   val asie      = 0x5c6
 
+  // Byte-granular data grant; use the same AS/M-only gate as A-side trap CSRs.
+  val asgrantbase = 0x5c7
+  val asgrantend  = 0x5c8
+  val asgrantcfg  = 0x5c9
+  val grantCSRs = Seq(asgrantbase, asgrantend, asgrantcfg)
+  val grantConfigMask: BigInt = BigInt("0000fffffffffff7", 16)
+
   /** M-mode 独占的 A-side exception/interrupt delegation bitmap。 */
   val aedeleg = 0x7c3
   val aideleg = 0x7c4
@@ -45,8 +52,8 @@ object NACCCSRs {
   val bitmapTargetStart = 0x7d3
   val bitmapTargetEnd   = 0x7d4
 
-  /** A 世界 trap CSR 的集合，用于访问控制判定。 */
-  val aTrapCSRs = Seq(astvec, asepc, ascause, astval, asscratch, asip, asie)
+  /** CSRs protected by the AS/M-only access gate. */
+  val aTrapCSRs = Seq(astvec, asepc, ascause, astval, asscratch, asip, asie) ++ grantCSRs
 }
 
 object NACCCauses {

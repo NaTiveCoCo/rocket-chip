@@ -54,6 +54,9 @@ class CustomCSRs(implicit p: Parameters) extends CoreBundle {
   def naccBitmapStorageBaseValue = 0.U(xLen.W)
   def naccBitmapTargetStartValue = 0.U(xLen.W)
   def naccBitmapTargetEndValue = 0.U(xLen.W)
+  def asGrantBaseValue = 0.U(xLen.W)
+  def asGrantEndValue = 0.U(xLen.W)
+  def asGrantConfigValue = 0.U(xLen.W)
 
   protected def getByIdOrElse[T](id: Int, f: CustomCSRIO => T, alt: T): T = {
     val idx = decls.indexWhere(_.id == id)
